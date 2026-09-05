@@ -7,7 +7,7 @@
 #set document(
   title: "The System Design Interview Playbook",
   author: "Providence Salumu",
-  keywords: ("system design", "interviews", "distributed systems", "google docs", "real-time collaboration", "google maps", "geospatial", "routing", "traffic", "rate limiting", "api gateway", "observability", "logging", "metrics", "comments", "ranking", "voting", "leaderboard", "top-k", "skip list"),
+  keywords: ("system design", "interviews", "distributed systems", "google docs", "real-time collaboration", "google maps", "geospatial", "routing", "traffic", "rate limiting", "api gateway", "observability", "logging", "metrics", "comments", "ranking", "voting", "leaderboard", "top-k", "skip list", "recommendation", "machine learning", "feed"),
   date: datetime(year: 2026, month: 9, day: 5),
 )
 
@@ -61,6 +61,9 @@
 
         Chapter 06 #h(4pt) #text(fill: rgb("#8E98C0"))[—] #h(4pt)
         Designing a Top-K Leaderboard (Gaming)
+
+        Chapter 07 #h(4pt) #text(fill: rgb("#8E98C0"))[—] #h(4pt)
+        Designing a Recommendation Engine (YouTube / TikTok)
       ]
     ]
     #v(1fr)
@@ -103,6 +106,7 @@
         [*v0.4*], [Chapter 4 — Distributed Logging & Metrics Platform], [2026-09-05],
         [*v0.5*], [Chapter 5 — Hierarchical Comment System (Reddit)], [2026-09-05],
         [*v0.6*], [Chapter 6 — Top-K Leaderboard (Gaming)], [2026-09-05],
+        [*v0.7*], [Chapter 7 — Recommendation Engine (YouTube / TikTok)], [2026-09-05],
       )
     ]
   ]
@@ -215,3 +219,4 @@ requirements, the math, the architecture, and the code — regardless of the pro
 #include "chapters/chapter-04.typ"
 #include "chapters/chapter-05.typ"
 #include "chapters/chapter-06.typ"
+#include "chapters/chapter-07.typ"
