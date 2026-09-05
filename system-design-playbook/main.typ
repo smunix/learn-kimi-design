@@ -7,7 +7,7 @@
 #set document(
   title: "The System Design Interview Playbook",
   author: "Providence Salumu",
-  keywords: ("system design", "interviews", "distributed systems", "google docs", "real-time collaboration", "google maps", "geospatial", "routing", "traffic", "rate limiting", "api gateway", "observability", "logging", "metrics"),
+  keywords: ("system design", "interviews", "distributed systems", "google docs", "real-time collaboration", "google maps", "geospatial", "routing", "traffic", "rate limiting", "api gateway", "observability", "logging", "metrics", "comments", "ranking", "voting"),
   date: datetime(year: 2026, month: 9, day: 5),
 )
 
@@ -55,6 +55,9 @@
 
         Chapter 04 #h(4pt) #text(fill: rgb("#8E98C0"))[—] #h(4pt)
         Designing a Distributed Logging & Metrics Platform
+
+        Chapter 05 #h(4pt) #text(fill: rgb("#8E98C0"))[—] #h(4pt)
+        Designing a Hierarchical Comment System (Reddit)
       ]
     ]
     #v(1fr)
@@ -95,6 +98,7 @@
         [*v0.2*], [Chapter 2 — Maps & Navigation Service (Google Maps)], [2026-09-05],
         [*v0.3*], [Chapter 3 — Distributed Rate Limiter], [2026-09-05],
         [*v0.4*], [Chapter 4 — Distributed Logging & Metrics Platform], [2026-09-05],
+        [*v0.5*], [Chapter 5 — Hierarchical Comment System (Reddit)], [2026-09-05],
       )
     ]
   ]
@@ -205,3 +209,4 @@ requirements, the math, the architecture, and the code — regardless of the pro
 #include "chapters/chapter-02.typ"
 #include "chapters/chapter-03.typ"
 #include "chapters/chapter-04.typ"
+#include "chapters/chapter-05.typ"
