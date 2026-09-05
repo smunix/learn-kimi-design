@@ -7,7 +7,7 @@
 #set document(
   title: "The System Design Interview Playbook",
   author: "Providence Salumu",
-  keywords: ("system design", "interviews", "distributed systems", "google docs", "real-time collaboration", "google maps", "geospatial", "routing", "traffic", "rate limiting", "api gateway", "observability", "logging", "metrics", "comments", "ranking", "voting", "leaderboard", "top-k", "skip list", "recommendation", "machine learning", "feed", "b-tree", "database", "index", "crdt", "replication", "consistency", "vector clock", "scheduler", "cron", "job", "workflow", "acid", "transaction", "mvcc", "isolation"),
+  keywords: ("system design", "interviews", "distributed systems", "google docs", "real-time collaboration", "google maps", "geospatial", "routing", "traffic", "rate limiting", "api gateway", "observability", "logging", "metrics", "comments", "ranking", "voting", "leaderboard", "top-k", "skip list", "recommendation", "machine learning", "feed", "b-tree", "database", "index", "crdt", "replication", "consistency", "vector clock", "scheduler", "cron", "job", "workflow", "acid", "transaction", "mvcc", "isolation", "ride-hailing", "uber", "geohash", "matching", "surge pricing"),
   date: datetime(year: 2026, month: 9, day: 5),
 )
 
@@ -76,6 +76,9 @@
 
         Chapter 11 #h(4pt) #text(fill: rgb("#8E98C0"))[—] #h(4pt)
         Designing for Correctness — How ACID Transactions Work
+
+        Chapter 12 #h(4pt) #text(fill: rgb("#8E98C0"))[—] #h(4pt)
+        Designing a Ride-Hailing Marketplace (Uber / Lyft)
       ]
     ]
     #v(1fr)
@@ -123,6 +126,7 @@
         [*v0.9*], [Chapter 9 — Conflict-Free Replication: How CRDTs Work], [2026-09-06],
         [*v0.10*], [Chapter 10 — Distributed Job Scheduler], [2026-09-06],
         [*v0.11*], [Chapter 11 — ACID Database Transactions], [2026-09-06],
+        [*v0.12*], [Chapter 12 — Ride-Hailing Marketplace (Uber / Lyft)], [2026-09-06],
       )
     ]
   ]
@@ -240,3 +244,4 @@ requirements, the math, the architecture, and the code — regardless of the pro
 #include "chapters/chapter-09.typ"
 #include "chapters/chapter-10.typ"
 #include "chapters/chapter-11.typ"
+#include "chapters/chapter-12.typ"
