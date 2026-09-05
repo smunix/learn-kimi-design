@@ -26,7 +26,7 @@
 
 == The Problem Statement
 
-The interviewer draws a clock and says:
+The interviewer draws a clock on the whiteboard and says:
 
 _"Design a distributed job scheduler. Users register jobs — one-shot
 ('fire at 3:00 AM'), recurring ('every weekday at 07:30'), or whole
@@ -36,13 +36,27 @@ thousands of firings per second at the peak. Jobs must not be lost, must
 not silently double-execute, and the scheduler itself must survive machine
 and region failures."_
 
-Every large company builds this system eventually, because the naive
-versions are all traps: a single machine running `cron` is a single point
-of failure; a `sleep()` in application code dies with the process; a
-database table polled by every worker is a lock convoy. The interview
-tests whether you can separate the system's three concerns — *knowing when
-jobs are due*, *deciding who fires them*, and *executing them without
-duplicates* — and scale each independently.
+Before you reach for any machinery, it is worth understanding why this
+problem exists at all — why every large company builds this system
+eventually, usually after being burned. The naive versions are all traps,
+and you have probably written one of them yourself. A single machine
+running `cron` works until the machine dies, and then nothing in the
+universe fires — a single point of failure with a silently-absent alarm.
+A `sleep()` call in application code is even more fragile: it dies with
+the process, and nobody even records that the timer ever existed. And the
+classic middle step — a database table of jobs polled by every worker —
+turns your database into a lock convoy the moment the worker fleet grows.
+What the interview is really testing is whether you can look at this
+problem and see that it is actually *three problems wearing one coat*:
+*knowing when jobs are due* (a data-structures problem), *deciding who
+fires them* (a distributed-ownership problem), and *executing them without
+duplicates* (a delivery-semantics problem). Each scales differently, fails
+differently, and deserves its own section — and separating them in your
+first five minutes at the whiteboard is the single highest-signal move in
+this interview.
+
+Three definitions will carry the whole chapter, so let's pin them down
+before any design work.
 
 #defterm([Job / run / trigger])[
   A _job_ is the registered specification: what to execute (a queue
@@ -53,6 +67,15 @@ duplicates* — and scale each independently.
   ephemeral. Confusing the two tables in the data model is the first
   design error this chapter avoids.
 ]
+
+Notice how much design is already hiding in that distinction. The job is
+what the user thinks about; the run is what the system thinks about. When
+a user edits a job at 02:59, they expect their edit to apply to the 03:00
+firing — but the run for 03:00 may already be enqueued with the old
+payload. When the scheduler crashes, the *jobs* must all survive (they are
+the product), while the *runs* may be replayed, retried, or reconstructed
+(they are the exhaust). Every table we draw later hangs off this one
+split.
 
 #defterm([Schedule / cron expression])[
   A compact description of recurring fire times. The classic _cron
@@ -75,7 +98,22 @@ duplicates* — and scale each independently.
   correct default — only a default you chose on purpose.
 ]
 
+Sit with those last two definitions for a moment, because they are where
+this problem stops being a puzzle about timers and becomes a puzzle about
+*promises*. "Every weekday at 07:30" sounds like a fact; it is actually a
+policy expressed in a notation that predates time-zone databases. The
+system you are about to design will make thousands of tiny judgment calls
+on behalf of its users — what to do about the minute that never existed,
+the hour that happened twice, the six minutes of downtime during a deploy
+— and the difference between a junior and a senior answer is whether those
+judgment calls are *declared per job* or *discovered in the incident
+report*.
+
 == Scope & Clarifying Questions
+
+Here is the conversation that bounds the problem. Notice how each answer
+eliminates an entire branch of the design space — that is what clarifying
+questions are *for*, and asking them crisply is half the interview.
 
 #tbl(
   (auto, 1fr),
@@ -90,6 +128,15 @@ duplicates* — and scale each independently.
     [Durability?], [Registered jobs survive region loss; run history retained 90 days],
   ),
 )
+
+Two of these answers deserve a highlight before we move on. "Seconds
+matter, microseconds do not" is a gift: it means you never need kernel
+timers, hardware timestamping, or any of the exotic machinery of
+low-latency trading — a one-second tick loop is plenty, and the design can
+spend its complexity budget on reliability instead of precision. And "push
+for effectively-once" is the interviewer telegraphing the chapter's core
+challenge: they want to hear you explain, unprompted, why exactly-once is
+not a thing engineering can buy. We will get there in Section 10.6.
 
 #notebox([Agreed scope])[
   + Design the *control plane*: job registration (one-shot, cron, DAG),
@@ -108,6 +155,11 @@ duplicates* — and scale each independently.
 ]
 
 == Functional Requirements
+
+Let's turn the prompt into commitments. Read each requirement and ask
+yourself which of the three sub-problems — trigger, firing, execution —
+it belongs to; you will find every one lands cleanly, which is your first
+confirmation that the three-way split is the right skeleton.
 
 + *Register and manage jobs.* Create, update, cancel, and inspect
   one-shot jobs (`fire_at = T`), recurring jobs (`cron` expression +
@@ -129,6 +181,15 @@ duplicates* — and scale each independently.
 + *Tenant fairness.* Per-tenant fire-rate quotas; bursts are smoothed or
   queued, never allowed to starve other tenants.
 
+Requirement 2 is phrased with unusual care — "produces a fire command",
+not "executes the job" — and you should mirror that care when you write
+your own requirements on the whiteboard. The scheduler's promise ends at
+the dispatch queue's door. How long the job takes, whether the worker
+fleet is big enough, whether the target service is up: those are the
+*worker's* problems. Keeping the promise boundary sharp is what lets you
+reason about the scheduler's SLO without dragging the entire downstream
+world into it.
+
 == Non-Functional Requirements
 
 - *Durability of the registry.* A registered job must survive the loss of
@@ -145,6 +206,14 @@ duplicates* — and scale each independently.
 - *Elastic scale-out.* Adding scheduler shards or worker pools raises
   capacity linearly; no component is a hard singleton (leases, not
   process identity, own the shards).
+
+Read the third bullet twice — it is the philosophical core of the whole
+design. You are *trading* loss for duplication on purpose. Loss is
+unrecoverable: a billing run that never happens is money silently gone.
+Duplication is recoverable: a billing run that happens twice is a bug you
+can detect and absorb — and Section 10.6 will show you exactly the
+machinery that absorbs it. Whenever a distributed system lets you choose
+which failure mode to live with, choose the one that leaves evidence.
 
 #defterm([At-least-once / at-most-once / exactly-once])[
   The three delivery guarantees a system can offer. _At-most-once_: fire
@@ -172,8 +241,11 @@ duplicates* — and scale each independently.
 
 == Back-of-the-Envelope: Timers, Bursts, and Workers
 
-Three numbers size the design: how many timers exist, how unevenly they
-fire, and how much execution capacity the fire rate implies.
+Three numbers size this design, and you should extract them from the
+interviewer before drawing a single box: how many timers exist (sets the
+store and the trigger structure), how unevenly they fire (sets the
+burst engineering), and how much execution capacity the fire rate implies
+(sets the worker fleet). Here are the assumptions we'll carry.
 
 *Assumptions.* 10⁷ registered jobs; recurring jobs fire hourly on average;
 job spec ≈ 1 KB; average run duration 30 s; 90-day run history at 1 KB per
@@ -194,6 +266,20 @@ run record.
   ),
 )
 
+Work the rows in order and you can feel the design assemble itself. The
+first row tells you the registry is small — 10 GB is a Tuesday for a
+replicated relational store, so durability here is cheap. The second row
+tells you the *average* workload is tiny — three thousand fires a second
+is one modest service. And then the third row ruins your afternoon: the
+top-of-hour burst is thirty times the average, because half of humanity
+types `0 * * * *` and means it. Row four is the reassurance that finding
+due work is easy *if* you index it (and Section 10.7 is entirely about
+that "if"). Rows five and six tell you the worker fleet and the queue are
+both comfortably inside machinery you have already designed in earlier
+chapters. Row seven quietly introduces a second product — run history is
+22 TB, a log-retention problem, not a scheduler problem. And the last row
+sets the failover budget the firing side must hit.
+
 #insight([The burst, not the average, designs the system])[
   The average fire rate needs one modest scheduler; the top-of-hour spike
   — half the world's cron jobs pinned to minute 0 — needs thirty. A
@@ -207,21 +293,36 @@ run record.
   retries and Chapter 8's rightmost hotspot, wearing a clock face.
 ]
 
+This is a pattern worth internalizing beyond this chapter: whenever your
+estimation table contains a row that is 30× its neighbor, the neighbor is
+irrelevant and the outlier *is* the design. You will see the same shape in
+Chapter 12's ride-hailing dispatch, where Friday-night demand dwarfs the
+weekly average, and in Chapter 3's rate limiter, where the whole point is
+that arrivals are not polite.
+
 == The Core Challenge: "Exactly Once" Is a Lie We Tell Well
 
 Ask ten engineers what a job scheduler must guarantee and nine say
 "exactly-once execution". The tenth — the one who has run one — says
-"effectively-once, and here is why." The reason is not engineering
-laziness; it is impossibility. Between "scheduler enqueues fire command"
-and "worker performs the side effect", a network and two processes can
-fail in combinations no protocol can distinguish: the worker that executed
-the job and *then* crashed before acking is indistinguishable from the
-worker that crashed before executing. The scheduler must retry, so
-duplicates on the wire are unavoidable. The only question is whether
-anyone can see them.
+"effectively-once, and here is why." Let's make you the tenth.
 
-So the challenge splits in two, and the design addresses each half with a
-different weapon:
+The reason is not engineering laziness; it is impossibility, and it is
+worth feeling the impossibility rather than memorizing the slogan. Walk
+the path of a single fire command: the scheduler enqueues it, a worker
+pulls it, the worker performs the side effect — charges the card, sends
+the email — and then acks the queue. Now ask: what happens if the worker
+crashes *after* the side effect but *before* the ack? The queue sees an
+un-acked command and, correctly, redelivers it. A second worker picks it
+up. Nobody anywhere in the system can tell whether the first worker
+executed or not — the crash erased exactly the one bit of information
+that would distinguish the two worlds. Since you cannot distinguish them,
+you must design for the worse one, which means you must retry, which means
+duplicates on the wire are unavoidable. That is the Two Generals problem
+wearing a hard hat: over an unreliable network, "did you get it?" can
+never be answered with certainty by the party who needs to know.
+
+So the core challenge splits cleanly in two, and the design addresses
+each half with a different weapon:
 
 + *The trigger side is a data-structures problem.* Ten million timers,
   thirty thousand firing per second at the peak, each fire time
@@ -234,6 +335,14 @@ different weapon:
   in-flight work must be reclaimed — all without a global lock. Section
   10.8 assembles leases, fencing tokens, and idempotency keys into
   exactly that.
+
+Notice the intellectual honesty baked into this split. The trigger side
+gets to live in a world of clean algorithms, because timers are just data.
+The firing side must live in the real world, where processes pause and
+networks lie. A common interview failure mode is to spend forty minutes
+perfecting the trigger structure and wave at the firing side — precisely
+backwards, because nobody's billing system was ever double-charged by a
+B+ tree.
 
 #insight([Effectively-once = at-least-once + idempotency + a dedup store])[
   The industry's entire answer, in one line: *deliver at least once,
@@ -252,8 +361,9 @@ different weapon:
 == Deep Dive: The Trigger Side — Finding What's Due
 
 The trigger side answers one question, 64 times a second per shard:
-*which jobs are due right now?* Three designs, in increasing
-sophistication — name all three in the interview, then defend your pick.
+*which jobs are due right now?* Let's look at three designs in increasing
+sophistication. In the interview you should name all three — the contrast
+is where the signal lives — and then defend your pick.
 
 *Design A: the indexed scan.* Store every job with a materialized
 `next_fire_at` column and a B+ tree index on `(shard, next_fire_at)` —
@@ -261,32 +371,47 @@ Chapter 8's structure, doing exactly the job it was designed for. A
 scheduler tick is one range scan (`next_fire_at ≤ now` within its shard
 slice) plus a linked-leaf walk; due jobs stream out in fire-time order at
 index speed. After firing (or enqueueing), the job's `next_fire_at` is
-recomputed from its cron expression and the row updated — the index
-maintains itself. This is the design this chapter ships: durable by
-construction (the timers *are* the database), crash-transparent (a dead
-scheduler's successor rescans and finds everything), and simple enough to
-reason about at 2 AM.
+recomputed from its cron expression and the row updated — so the index
+maintains itself, and the "timer" for next Tuesday is nothing more than a
+row whose index key sorts after today's. This is the design this chapter
+ships, and the reasons are worth saying out loud: it is durable by
+construction (the timers *are* the database — there is no in-memory state
+to lose), crash-transparent (a dead scheduler's successor simply rescans
+and finds everything, no rebuild step, no warm-up gap), and simple enough
+to reason about at 2 AM, which is when you will be reasoning about it.
 
 *Design B: the in-memory min-heap.* Keep a priority queue of
-`(fire_at, job)` keyed by soonest-first (the Rust listing in Section
-10.13). O(log n) per schedule or cancel-via-lazy-tombstone, O(1) peek at
-the next due job, zero index maintenance. The catch: the heap is
-*volatile* — it must be rebuilt from the store on every failover, and at
-10⁷ timers that is a 10–30 s cold start during which the shard is blind.
-Production systems use the heap as a *hot cache in front of Design A*:
-the tick loop keeps the next few seconds of timers in memory so the scan
-runs once per window, not once per timer.
+`(fire_at, job)` keyed by soonest-first — the Rust listing in Section
+10.13 implements exactly this. O(log n) per schedule or
+cancel-via-lazy-tombstone, O(1) peek at the next due job, zero index
+maintenance. As an algorithm it is lovely. The catch is that the heap is
+*volatile*: it must be rebuilt from the store on every failover, and at
+10⁷ timers that is a 10–30 s cold start during which the shard is blind —
+blind, notice, for *longer than the 15-second failover SLO* we just
+committed to. The production answer is not to choose but to layer: use
+the heap as a *hot cache in front of Design A*. The tick loop keeps only
+the next few seconds of timers in memory, refilling from the index once
+per window; the store sees one scan per shard-second, not one per timer,
+and the heap's volatility no longer matters because its contents are
+always re-derivable in one scan.
 
-*Design C: the hashed timing wheel.* The classic kernel answer (Kafka,
-Netty, and the Linux kernel itself): an array of buckets representing
-time slots — slot `i` holds every timer due at `now + i·tick` mod the
-wheel's circumference — so insert and expire are O(1) pointer pushes. A
-*hierarchical* wheel (a seconds-wheel feeding a minutes-wheel feeding an
-hours-wheel, like a clock's gears) covers far-future timers in O(wheels)
-per operation. Beautiful, optimal, and entirely in-memory: the same
-durability problem as the heap, plus resize pain, plus a poor fit for
-cancel-heavy workloads. Worth describing to show range; wrong as the
-system of record.
+*Design C: the hashed timing wheel.* The classic kernel answer — Kafka's
+delayed operations, Netty's timers, and the Linux kernel itself all use
+one. Picture an array of buckets representing time slots: slot `i` holds
+every timer due at `now + i·tick`, modulo the wheel's circumference, so
+insert and expire are O(1) pointer pushes and the whole structure advances
+one slot per tick like a clock hand. A *hierarchical* wheel stacks
+coarser wheels the way a clock stacks gears: a seconds-wheel feeds a
+minutes-wheel feeds an hours-wheel, and a timer due next year parks
+cheaply in the outer wheel until it cascades down through the gears toward
+its tick. Beautiful, optimal, and entirely in-memory — which means it
+inherits the heap's durability problem, adds resize pain when the wheel
+fills, and fits cancel-heavy workloads poorly (cancelling means splicing
+out of a bucket you must first find). Worth describing in the interview
+to show range; wrong as the system of record. If the interviewer pushes —
+"but the wheel is O(1)!" — your answer is: *the scan is already fast
+enough, and durability is not a feature you can bolt onto volatility
+later.*
 
 #defterm([Timing wheel (hashed / hierarchical)])[
   A ring buffer of buckets indexed by time slot: a timer due in _k_ ticks
@@ -310,15 +435,23 @@ system of record.
 
 == Deep Dive: The Firing Side — Leases, Fencing, Idempotency
 
-The firing side answers a harder question: *who* may fire shard 37's due
-jobs — and how do we stop yesterday's answer from firing them again?
+The firing side answers a harder question than the trigger side ever
+asked: *who* may fire shard 37's due jobs — and how do we stop
+*yesterday's* answer from firing them again? That second clause is where
+the difficulty lives, and it is why this section needs three mechanisms
+stacked, not one.
 
-*Shard ownership by lease.* The 10⁷ jobs are hash-partitioned by `job_id`
-into (say) 64 shards. A scheduler replica acquires a shard by taking its
-*lease* from a small highly-available coordination store; it renews the
-lease every few seconds and loses it silently if it stalls (GC pause,
-network hiccup, death). A standby replica takes over an expired lease —
-failover in ≤ 15 s, per the SLO.
+*Shard ownership by lease.* Hash-partition the 10⁷ jobs by `job_id` into
+(say) 64 shards — 64 is arbitrary; what matters is that it is much larger
+than your replica count, so ownership can be rebalanced finely. A
+scheduler replica acquires a shard by taking its *lease* from a small
+highly-available coordination store; it renews the lease every few
+seconds and loses it silently if it stalls — a GC pause, a network
+hiccup, death. A standby replica takes over an expired lease, giving you
+failover in ≤ 15 s per the SLO. Why leases instead of a proper consensus
+election per scheduling decision? Because consensus-per-operation would
+put a WAN round-trip inside every tick, and the tick is once per second.
+The lease converts a per-operation cost into a per-few-seconds cost.
 
 #defterm([Lease])[
   A time-bounded grant of exclusive ownership: "replica R owns shard S
@@ -328,6 +461,17 @@ failover in ≤ 15 s, per the SLO.
   lease silently expired" and "I find out": during that gap the old owner
   still believes itself owner, and two owners double-fire.
 ]
+
+That danger deserves a concrete scene, because it is the scene fencing
+exists for. Replica A holds shard 37's lease with a 10-second TTL. At
+t=7 s, A enters a stop-the-world GC pause. At t=10 s the lease expires;
+at t=12 s standby B takes over and starts firing shard 37's due jobs. At
+t=18 s, A wakes up, checks its clock, believes it is still inside its
+lease — its last renewal said "valid until t=10+10" and its clock, frozen
+during the pause, tells it only t=9 has passed — and fires the same due
+jobs a second time. Two owners, both honest, both wrong. You cannot fix
+this by making A smarter; A *cannot know*. So you make the rest of the
+world smarter instead.
 
 #defterm([Fencing token])[
   A monotonically increasing number issued by the lease store on every
@@ -341,18 +485,33 @@ failover in ≤ 15 s, per the SLO.
   implements both in forty lines.)
 ]
 
-*Why duplicates survive all of this anyway.* Suppose leases and fencing
-work perfectly: single owner per shard, always. A fire command is still
+In our scene, A's dispatches carry token 41 and B's carry token 42; the
+queue (or the job store) has already seen 42 and turns A away at the
+door. The deposed scheduler is stopped not by being informed — informing
+it is exactly what the network cannot guarantee — but by being *refused*.
+That inversion is the whole idea, and it generalizes far beyond this
+chapter: whenever ownership can change hands while a client is
+partitioned or paused, the resource itself must check credentials on
+every operation, and the credentials must be *ordered*.
+
+*Why duplicates survive all of this anyway.* Now the uncomfortable part,
+which is also the most instructive. Suppose leases and fencing work
+perfectly: single owner per shard, always. A fire command is *still*
 delivered at-least-once, because the worker may crash *after* executing
-but *before* acking, and the queue (correctly) redelivers. Fencing cannot
-help here — the *same* token legitimately appears twice. This is why the
-last line of defense lives at the point of side effect: the worker claims
-the run's idempotency key `(job_id, scheduled_time)` in the dedup store
-before touching the world, and marks it complete after. A redelivered
-command finds the key claimed and exits 0. The system is a pipeline of
-decreasing error rates: leases make double-ownership rare, fencing makes
-it harmless, queues make delivery at-least-once, and idempotency makes
-that invisible.
+but *before* acking, and the queue — correctly — redelivers. Fencing
+cannot help here, and it is worth seeing precisely why: the duplicate is
+not a *stale* holder presenting an old token; it is the *same* holder's
+legitimate command appearing twice. Ordered credentials distinguish old
+owners from new owners; they say nothing about replays *within* one
+owner's reign. This is why the last line of defense lives at the point of
+side effect: the worker claims the run's idempotency key
+`(job_id, scheduled_time)` in the dedup store before touching the world,
+and marks it complete after. A redelivered command finds the key claimed
+and exits 0. Step back and admire the shape of what we just built: the
+system is a pipeline of decreasing error rates. Leases make
+double-ownership rare. Fencing makes double-ownership harmless. The queue
+makes delivery at-least-once. And idempotency makes at-least-once
+invisible. No single layer is airtight; the stack is.
 
 #defterm([Heartbeat])[
   A periodic "I am alive and working on X" signal from a component —
@@ -367,17 +526,27 @@ that invisible.
 
 == Deep Dive: Retries, Backoff, Jitter, and the Dead-Letter Queue
 
-A run fails. What happens next is policy, and policy is design.
+A run fails. What happens next is policy, and policy is design — this
+section is short on algorithms and long on judgment, which is exactly why
+interviewers probe it.
 
 *Retry with exponential backoff and full jitter.* Attempt _k_ waits
-`random(0, min(cap, base · 2ᵏ))`: the mean doubles each attempt (giving a
-struggling dependency room to recover), the cap keeps the tail sane, and
-the randomization — *full jitter*, drawn fresh per (job, attempt) —
-spreads a fleet of simultaneous failures across the whole window instead
-of re-stampeding the dependency in lockstep. This is Chapter 3's token
-bucket seen from the other side: there we *rate-limited clients*; here we
-rate-limit *ourselves*, because a retry storm is a self-inflicted
-denial-of-service.
+`random(0, min(cap, base · 2ᵏ))`. Unpack each ingredient, because each
+neutralizes a specific failure mode. The exponential mean doubles per
+attempt, giving a struggling dependency exponentially more room to
+recover — if the target database is down for thirty seconds, your first
+retry at 100 ms was never going to succeed, so why spend it? The cap
+keeps the tail sane: without it, attempt 30 waits a geological age, and
+your "retry" is indistinguishable from "lost". And the randomization —
+*full jitter*, drawn fresh per (job, attempt) — spreads a fleet of
+simultaneous failures across the whole window instead of re-stampeding
+the dependency in lockstep. Picture ten thousand runs that all failed at
+t=0 because the target hiccuped: without jitter they all retry at
+t=100 ms, then all at t=200 ms, a self-inflicted denial-of-service in
+perfect formation. With jitter they smear across `[0, 2ᵏ·base)` and the
+dependency sees a load it can survive. This is Chapter 3's token bucket
+seen from the other side: there we *rate-limited clients*; here we
+rate-limit *ourselves*, because a retry storm is friendly fire.
 
 #defterm([Dead-letter queue (DLQ)])[
   The terminal queue for runs that exhaust their retry budget. A DLQ is
@@ -389,14 +558,20 @@ denial-of-service.
   human should ever reconstruct state from logs alone.
 ]
 
-*Which failures retry and which don't.* Distinguish *retryable* errors
-(timeouts, 502s, connection resets — the dependency might recover) from
-*permanent* ones (400, schema rejection, "no such user" — retrying is
-just slow failure). Only retryable errors consume the budget; permanent
-errors dead-letter immediately. One more taxonomy line separates senior
-answers: a *poison message* — a run that crashes every worker that
-touches it — is detected by "attempts exhausted with crash-looping
-workers" and dead-lettered before it can saw through the fleet.
+*Which failures retry and which don't.* Here is a taxonomy line that
+separates senior answers: distinguish *retryable* errors (timeouts, 502s,
+connection resets — the dependency might recover) from *permanent* ones
+(400, schema rejection, "no such user" — retrying is just slow failure,
+and slow failure with a backoff cap is the worst of both worlds: you pay
+the latency and still land in the DLQ). Only retryable errors consume the
+budget; permanent errors dead-letter immediately. And one more category,
+rarer but deadlier: a *poison message* — a run that crashes every worker
+that touches it, say because its payload triggers an untested code path.
+Each individual attempt looks like a worker crash, so naive systems just
+keep redelivering, and the message saws through the fleet one worker at a
+time. The detection rule is "attempts exhausted *with crash-looping
+workers*", and the response is immediate dead-lettering plus a circuit
+breaker on the target — quarantine the patient before you autopsy it.
 
 #tip([Say the quiet part about 2:30 AM])[
   Retry policy, misfire policy, and DST policy are where schedulers hurt
@@ -412,7 +587,10 @@ workers" and dead-lettered before it can saw through the fleet.
 
 Real pipelines are not independent jobs: _extract_ must finish before
 _transform_, which feeds three parallel _load_ jobs, which gate
-_notify_. The scheduler must understand dependencies.
+_notify_. So far our scheduler understands time but not dependency —
+and the moment you say "B runs after A succeeds", you have left the land
+of timers and entered the land of graphs. Fortunately you need exactly
+one graph concept, and it comes with a built-in execution plan.
 
 #defterm([DAG (directed acyclic graph) / workflow])[
   A _directed_ graph: edges mean "depends on" (B's incoming edge from A
@@ -425,17 +603,32 @@ _notify_. The scheduler must understand dependencies.
   concurrently; the workflow's critical path is its longest layer chain.
 ]
 
-*Mechanics.* A workflow is stored as a job graph plus one *run record* per
-workflow instance. When a run completes, the scheduler decrements the
+*Mechanics.* A workflow is stored as a job graph plus one *run record*
+per workflow instance — the job/run split from Section 10.1, applied
+recursively. When a run completes, the scheduler decrements the
 *pending-dependency count* of each child in the store; a child whose
 count hits zero becomes a normal due job and enters the trigger pipeline
-— no special machinery downstream. Failure policy is per-workflow:
-*fail-fast* (first failure cancels pending descendants, workflow run
-fails) or *complete-branches* (unaffected branches run to completion —
-right for fan-out reports). Compensation — "payment captured, refund if
-shipping fails" — is the workflow-level echo of Chapter 9's invariant
-boundary: it is *application* logic the scheduler must make expressible,
-not a guarantee it can manufacture.
+— no special machinery downstream, and that "no special machinery" is
+worth dwelling on. The trigger side never learns that workflows exist.
+The firing side never learns that workflows exist. Workflows are a
+*write-time transformation* of the data model: dependencies live entirely
+in "not due yet". This is one of the cleanest examples in the book of a
+principle you should carry everywhere — the best way to add a feature to
+a system is to reduce it to something the system already does.
+
+Failure policy is per-workflow, and the two standard policies map onto
+two genuinely different product intents: *fail-fast* (first failure
+cancels pending descendants; the workflow run fails) is right when the
+stages are steps of one logical operation — a half-migrated database is
+worse than an un-migrated one; *complete-branches* (unaffected branches
+run to completion) is right for fan-out reports, where the marketing
+dashboard being generated is no reason to cancel the finance one.
+Compensation — "payment captured, refund if shipping fails" — is the
+workflow-level echo of Chapter 9's invariant boundary: it is
+*application* logic the scheduler must make expressible, not a guarantee
+it can manufacture. Say that sentence in the interview; it is the
+difference between a candidate who has read about sagas and one who knows
+why sagas exist.
 
 #insight([The scheduler's data model in one breath])[
   `jobs` (durable specs, indexed by `(shard, next_fire_at)`) ·
@@ -451,11 +644,16 @@ not a guarantee it can manufacture.
 
 == API Design
 
-The surface is deliberately small: jobs and workflows in, runs and
-dead-letters out, and a handful of internal endpoints for the lease and
-dispatch machinery. Every mutating client call accepts an idempotency key
-(Chapter 5's vote endpoint, generalized); every internal dispatch carries
-a fencing token (Section 10.8).
+With the machinery understood, the API almost writes itself — and that is
+the point of doing the deep dives first. The surface is deliberately
+small: jobs and workflows in, runs and dead-letters out, plus a handful
+of internal endpoints for the lease and dispatch machinery. Two
+disciplines run through every row of the table, and you should name them
+as you draw it: every mutating *client* call accepts an idempotency key
+(Chapter 5's vote endpoint, generalized — a retried `POST /jobs` must not
+create two jobs), and every *internal* dispatch carries a fencing token
+(Section 10.8), because internal traffic is exactly where stale owners
+live.
 
 #tbl(
   (1.35fr, 0.7fr, 2.25fr),
@@ -474,6 +672,17 @@ a fencing token (Section 10.8).
   ),
 )
 
+Read the `PATCH` row slowly — it hides the most elegant move in the whole
+API. When a user reschedules a job, you might expect a hunt through some
+timer structure to find and remove the old entry. Instead, the row's
+`next_fire_at` is simply overwritten, and the old heap entry — still
+sitting in some scheduler's memory — becomes a *lazy tombstone*: when it
+eventually pops, the `live` check (the Rust listing's trick, Section
+10.13) finds the map disagrees and discards it. The update path never
+touches the scheduler fleet at all. And the two `dispatch` rows encode
+the queue's half of the reliability story: pulling starts a timer, acking
+stops it, and the timer firing means "assume the worst, redeliver".
+
 #defterm([Visibility timeout])[
   The queue's redelivery timer: a pulled message becomes invisible to
   other consumers for T seconds; if the puller neither acks nor abandons
@@ -485,10 +694,11 @@ a fencing token (Section 10.8).
 
 == High-Level Architecture
 
-Read the diagram top to bottom as *registration*, then top to bottom
-again as *firing*: two flows sharing five tables. The write path a user
-sees ends at the job store; everything below it is the system talking to
-itself.
+Here is the whole chapter in one picture. Before you trace any arrows,
+notice the layout's deliberate honesty: the diagram has two *stories*
+running through the same boxes — a registration story (short, horizontal,
+top row) and a firing story (long, vertical, everything below) — and the
+five tables from the data-model insight are where the stories meet.
 
 #canvas(h: 8.1cm)[
   // row 0: clients, api, job store
@@ -527,28 +737,91 @@ itself.
   #arrow(9.95cm, 6.65cm, 9.95cm, 7.05cm, color: crimson, dashed: true)
 ]
 
-#notebox([Reading the diagram])[
-  *Registration* flows right along the top: the API validates the cron
-  expression, stamps the job with its shard (`hash(job_id) mod 64`), its
-  splay offset, and its first `next_fire_at`, and writes it to the job
-  store — done; the user gets an ack without any timer existing yet.
-  *Firing* flows downward: each scheduler replica range-scans the due
-  slice of *its* shards (the Chapter 8 leaf walk), enqueues
-  idempotency-keyed fire commands, workers pull and execute — checking
-  the dedup store before any side effect — and exhausted runs drain to
-  the DLQ with their full context. No box is a global singleton: the API
-  is stateless, the store is replicated, schedulers are fungible behind
-  leases, the queue is a partitioned log, workers are a pool.
-]
+Let's walk it twice, once per story, the way you would narrate it at the
+whiteboard.
+
+*The registration story takes ten seconds and stays on the top row.* A
+client calls `POST /jobs` with a cron expression and a time zone. The API
+service — stateless, horizontally scaled, doing nothing but validation,
+cron parsing, and arithmetic — checks the schedule is well-formed,
+computes the job's shard as `hash(job_id) mod 64`, applies the splay
+offset that flattens the top-of-hour herd, and materializes the first
+`next_fire_at` in UTC. Then it writes the row to the job store and acks.
+That is the *entire* user-visible write path: no timer exists yet, no
+scheduler has been contacted, no thread is sleeping anywhere. The
+registered job is simply a row that sorts into the right place in the
+`(shard, next_fire_at)` index — a fact in a B+ tree, waiting for time to
+catch up with it. This is worth pausing on, because it is the design's
+central aesthetic: *registration is just indexing*. The future fire is
+not an action anyone scheduled; it is a query result nobody has run yet.
+
+*The firing story is the system talking to itself, and it flows
+downward.* Each scheduler replica holds leases on a slice of shards — the
+diagram shows two active replicas and a standby, which is the shape you
+want: ownership is pre-divided so failover is an arithmetic reassignment,
+not a negotiation. Once per second, each replica range-scans the due
+slice of *its* shards against the job store (the Chapter 8 leaf walk —
+the "poll due slice" arrow dropping from the store into the standby row
+depicts exactly this loop). For every due row it does two things: enqueue
+an idempotency-keyed fire command onto the dispatch queue — the teal box,
+Chapter 4's durable at-least-once log — and advance the row's
+`next_fire_at`, so a rescan never sees the job as due twice. Those teal
+arrows fanning from all three schedulers into the one queue are worth a
+look: they are the point where ownership converges, and it is why every
+command carries a fencing token — the queue is the downstream system that
+deposes stale holders.
+
+*The bottom two rows are where the world gets touched, and they are drawn
+in the order of paranoia you should feel.* Workers *pull* batches from
+the queue — never push — so a slow pool is self-throttling backpressure
+rather than a drowning victim. The label "workers pull; ack only after
+the side effect" is the at-least-once contract in eight words: the
+visibility timeout starts at pull, and only a post-side-effect ack stops
+it. Before touching the world, the worker claims the run's idempotency
+key in the dedup store — the "claim key first" arrow running from the
+worker pool leftward into the dedup box is drawn in that direction on
+purpose: the dedup store is consulted *before*, not after. And the dashed
+crimson arrow dropping from the workers into the dead-letter queue is the
+path nobody wants and everybody needs: retries exhausted, context
+preserved, operator paged, redrive possible. Two worker pools are drawn
+— a general "execute + heartbeat" pool and a "GPU / batch" pool — to make
+one last point visible: execution classes scale independently, sharing
+nothing but the queue.
+
+Stand back and count singletons. There are none. The API is stateless.
+The job store is replicated. The schedulers are fungible behind leases —
+kill any one and the standby's next tick covers its shards. The queue is
+a partitioned log. The workers are a pool. The dedup store is a keyed
+lookup that any replicated KV can serve. Every box in the diagram can be
+replaced while the system is running, and the design's promises survive
+the replacement — which, more than any single mechanism, is what
+"distributed" was supposed to mean.
 
 == Rust Reference Implementations
 
-Four pieces with deterministic tests: the due-job heap, the lease table
-with fencing, the backoff schedule, and the DAG layerer. Together they are
-the scheduler's entire inner loop, small enough to hold in your head and
-sharp enough to defend line by line.
+Time to make the chapter compile. The four listings below are the
+scheduler's entire inner loop: the due-job heap (the trigger side's hot
+cache), the lease table with fencing (the firing side's ownership
+protocol), the backoff schedule (the failure policy's arithmetic), and
+the DAG layerer (the workflow engine in forty lines). Each is small
+enough to hold in your head, sharp enough to defend line by line in an
+interview, and — most importantly — each ships with deterministic tests
+that *demonstrate* the property the prose claimed. When you study these,
+don't read the code first; read the tests first. The tests are the
+contracts.
 
 === The Due-Job Heap (Lazy Cancellation)
+
+This is Design B from Section 10.7 — the in-memory min-heap that rides in
+front of the indexed scan. Two details repay attention before you read a
+line of code. First, Rust's `BinaryHeap` is a *max*-heap, so the `Ord`
+impl inverts the comparison — soonest `fire_at` compares "greatest" and
+pops first, with a sequence number breaking ties so equal fire times fire
+in submission order. Second, cancellation is *lazy*: `cancel` never
+touches the heap at all. It just updates the `live` map, and the stale
+entry — a "dud" — is discovered and skipped when it pops. Read `pop_due`
+as a tiny state machine: peek, compare against `now`, pop, validate
+against `live`, and only then emit.
 
 ```rust
 use std::collections::{BinaryHeap, HashMap};
@@ -657,14 +930,35 @@ mod tests {
 }
 ```
 
-The `live` map is the whole trick: cancellation in a binary heap is O(n)
-if done eagerly (find the entry, remove it, re-heapify) and O(1) if done
-lazily (record the truth, let the heap find out when it matters). With
-cancel-heavy workloads this is the difference between a timer structure
-and a performance incident — and the same lazy-tombstone pattern as
-Chapter 9's OR-Set removals.
+The `live` map is the whole trick, and it deserves a cost analysis in
+both directions so you can defend the choice under pressure. Eager
+cancellation in a binary heap is O(n): find the entry (the heap gives you
+no index), remove it, re-heapify. Lazy cancellation is O(1): record the
+truth, let the heap find out when it matters. The price you pay is
+bounded garbage — every cancel or reschedule leaves one dud in the heap
+until its old fire time passes, so the heap can hold at most (operations
+so far) entries instead of (live timers) — and for a cache that is
+refilled from the store every few seconds anyway, that bound is trivially
+acceptable. With cancel-heavy workloads this is the difference between a
+timer structure and a performance incident — and you have seen the shape
+before: it is the same lazy-tombstone pattern as Chapter 9's OR-Set
+removals, where deleting eagerly was impossible and deleting lazily was
+free.
 
 === Leases with Fencing Tokens
+
+This listing is Section 10.8's whole protocol in two functions, and the
+brevity is the lesson: leases and fencing are not heavyweight
+infrastructure, they are a `HashMap` and a counter. `acquire` implements
+the ownership rule — fail only if *another* holder's lease is still live;
+an expired lease can always be taken over, and every grant bumps the
+global fencing counter. `check_fence` is the downstream side — keep a
+per-shard "highest token seen" and accept a dispatch only from a strictly
+newer holder. Watch the third test: it is the GC-pause scene from Section
+10.8 replayed in miniature. The fresh holder's token 5 is accepted; the
+deposed holder waking up with token 4 is turned away; even a *replay* of
+the accepted token 5 is rejected, because fencing tokens order holders,
+not messages — and then the next legitimate holder proceeds with 6.
 
 ```rust
 use std::collections::HashMap;
@@ -746,7 +1040,27 @@ mod tests {
 }
 ```
 
+One design note you can volunteer: `acquire` hands a fresh fencing token
+even on *renewal* by the same holder. That is deliberate — a token that
+only ever meant "latest owner" would suffice for deposing, but
+renew-on-every-grant also makes each individual renewal itself a
+witnessed, ordered event, which downstream auditors appreciate. The cost
+is one integer.
+
 === Exponential Backoff with Full Jitter
+
+The retry arithmetic from Section 10.9. Two implementation choices are
+worth your attention because interviewers pounce on both. First, the
+jitter is *deterministic*: a splitmix64 hash over `(job, attempt)` rather
+than a thread-local RNG. That makes every retry schedule reproducible per
+job — you can replay an incident's timing exactly — and it removes shared
+RNG state from a hot path. Second, the shifts are defensive:
+`1u64 << attempt.min(20)` caps the exponent so a pathological
+`max_attempts` can never overflow the shift, and `saturating_mul`
+guarantees the ceiling math degrades to the cap rather than wrapping.
+Read the tests as the two properties you actually bought: the window
+grows and caps (test one), and the fleet genuinely spreads inside the
+window while staying deterministic per key (test two).
 
 ```rust
 /// Retry schedule: attempt k waits random(0, min(cap, base * 2^k)).
@@ -813,6 +1127,19 @@ mod tests {
 ```
 
 === DAG Layers (Kahn's Algorithm)
+
+Last, the workflow engine — and the surprise is how little of it there
+is. Kahn's algorithm (1962) peels the zero-indegree frontier repeatedly:
+layer 0 is every job with no dependencies, layer 1 is everything whose
+dependencies all landed in layer 0, and so on. The function returns
+`Option`: `None` means the graph was malformed — a cycle, or a dependency
+on a job that was never submitted — and per Section 10.10's rule, that
+rejection happens at *submission time*, loudly, in the API service,
+rather than at 3 AM in the trigger pipeline. Note the two data-structure
+choices doing quiet work: `BTreeMap`/`BTreeSet` keep iteration ordered so
+the layers come out deterministic (essential for testing, pleasant for
+debugging), and the `?` on `indegree.get_mut(&job)` is the unknown-job
+rejection falling out of the type system for free.
 
 ```rust
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -899,10 +1226,16 @@ mod tests {
 ```
 
 The layer view is not just validation — it *is* the workflow execution
-plan. The scheduler fires layer 0, and each run completion decrements its
-children's pending counts in the store; a child reaching zero is promoted
-to a normal due job. The trigger pipeline from Section 10.7 never learns
-that workflows exist — separation of concerns, enforced by the data model.
+plan, and closing that loop is the section's payoff. The scheduler fires
+layer 0 through the ordinary trigger pipeline; each run completion
+decrements its children's pending counts in the store; a child reaching
+zero is promoted to a normal due job with `next_fire_at = now`. The
+trigger pipeline from Section 10.7 never learns that workflows exist —
+separation of concerns, enforced by the data model. And the cycle check
+has one more pleasant property worth naming: because it runs at
+submission, a cycle can never be *created by time itself* — no failover,
+no race, no partial write can turn an accepted workflow into a hang,
+because the shape was proven acyclic before the first job ever fired.
 
 #tip([Name the classics when you borrow them])[
   Kahn's algorithm (1962) for topological layering, the hashed timing
@@ -915,32 +1248,50 @@ that workflows exist — separation of concerns, enforced by the data model.
 
 == Scaling the Design
 
+The design scales along three axes, and — as in Chapter 9 — it is worth
+naming them separately because they fail and are fixed independently.
+
 *More timers.* Sharding by `hash(job_id) mod N` scales the trigger side
-horizontally: 64 shards today, 1 024 tomorrow — a lease-table rebalance,
-not a redesign. The due-scan per shard stays a bounded range query no
-matter how large the job table grows, because the index, not the table
-size, sets the cost (Chapter 8's height-3 lesson). The in-memory heap of
-Section 10.13 rides in front of each shard's scan as a hot cache: the
-replica refills it with the next few seconds of timers per tick, so the
-store sees one scan per shard-second, not one per timer.
+horizontally: 64 shards today, 1024 tomorrow — a lease-table rebalance,
+not a redesign. The crucial invariant is that the due-scan per shard
+stays a bounded range query no matter how large the job table grows,
+because the *index*, not the table size, sets the cost — Chapter 8's
+height-3 lesson paying rent again. And remember the layering from Section
+10.7: the in-memory heap rides in front of each shard's scan as a hot
+cache, so the replica refills it with the next few seconds of timers per
+tick and the store sees one scan per shard-second, not one per timer.
+Growing timers by 100× changes the fan-in of that refill, nothing else.
 
-*More firing rate.* The dispatch queue partitions by shard and scales like
-Chapter 4's log; worker pools scale independently per execution class —
-the GPU pool and the HTTP pool share nothing but the queue. Per-tenant
-fairness is enforced at *enqueue* time with Chapter 3's token bucket: a
-tenant past its quota has its fire commands delayed, not dropped, and the
-splay from Section 10.5 keeps the aggregate curve flat enough that quotas
-rarely bite.
+*More firing rate.* The dispatch queue partitions by shard and scales
+like Chapter 4's log — add partitions, add consumer groups. Worker pools
+scale independently per execution class: the GPU pool and the HTTP pool
+share nothing but the queue, so a batch-job tenant's fleet can triple
+without one HTTP worker being requisitioned. Per-tenant fairness is
+enforced at *enqueue* time with Chapter 3's token bucket: a tenant past
+its quota has its fire commands delayed, not dropped — delayed, because
+dropped fire commands are misfires, and misfires invoke policy, whereas
+delays are just latency the SLO already budgets. And the splay from
+Section 10.5 keeps the aggregate curve flat enough that quotas rarely
+bite in the first place.
 
-*More regions.* The job store replicates cross-region (Chapter 9's
-machinery would make specs available everywhere); schedulers run
+*More regions.* The job store replicates cross-region — Chapter 9's
+machinery would make specs available everywhere — and schedulers run
 active-active with region-local shard ownership, so a region loss moves
-leases, not data. Clock discipline is the quiet dependency: schedulers
-reason about "now" via NTP-disciplined UTC, and fire times are always
-stored in UTC with the tenant's zone applied at materialization — the DST
-trap of Section 10.1 is a data-model decision, not a runtime surprise.
+*leases*, not data. That distinction is the whole sentence: leases are
+recomputed in seconds from a coordination store; data would have to be
+re-shipped or, worse, reconstructed. Clock discipline is the quiet
+dependency under everything: schedulers reason about "now" via
+NTP-disciplined UTC, and fire times are always stored in UTC with the
+tenant's zone applied at materialization — the DST trap of Section 10.1
+is a data-model decision, not a runtime surprise.
 
 == Failure Modes & Degradation
+
+Walk this table the way an on-call engineer reads a runbook: for each
+row, ask "what does the *user* see, and which mechanism we already built
+is the one that saves them?" You will find every answer is a mechanism
+from Sections 10.6–10.9 operating exactly as designed — no row requires
+heroics, which is the definition of a mature failure story.
 
 #tbl(
   (0.95fr, 1.4fr, 1.8fr),
@@ -956,6 +1307,17 @@ trap of Section 10.1 is a data-model decision, not a runtime surprise.
   ),
 )
 
+The first row deserves special reverence because it contains the deepest
+sentence in the chapter: *the store is the truth, the queue an
+accelerator*. Once you believe that sentence, scheduler crashes stop
+being scary. The dead replica took no irreplaceable state with it — its
+heap was a cache, its leases expire on their own, and its successor's
+first action is the same action it performs every second anyway: scan the
+due slice. Failover is not a special mode; it is the normal loop, started
+from a cold cache. Design every stateful system so that recovery is "the
+steady state, resumed" and you will sleep better than engineers who build
+recovery procedures.
+
 #pitfall([The double-fire you designed yourself])[
   The most common self-inflicted duplicate: a scheduler that enqueues the
   fire command and *then* updates `next_fire_at` — crashing in between
@@ -970,6 +1332,12 @@ trap of Section 10.1 is a data-model decision, not a runtime surprise.
 
 == Trade-offs & Alternatives
 
+Every row of this table is a decision you made earlier in the chapter;
+this section exists so you can defend them as *choices*, with a named
+alternative and a reason it loses — here, under these requirements, not
+in the abstract. That last qualifier matters: several "losers" below are
+the right answer at a different scale, and saying so is worth points.
+
 #tbl(
   (1.2fr, 1.15fr, 1.35fr, 1.35fr),
   header: (hcell[Choice], hcell[We picked], hcell[Alternative], hcell[Why the alternative loses (here)]),
@@ -983,10 +1351,25 @@ trap of Section 10.1 is a data-model decision, not a runtime surprise.
   ),
 )
 
+Read the last row as the *organizational* trade-off, because it is the
+one interviewers with production scars care about most. Per-app cron
+works — that is the damning part. It works right up until the company has
+a thousand repos, each with its own retry policy, its own misfire
+default, its own idea of what "02:30 on fall-back day" means, and no
+audit trail anywhere. The central service exists to *own the policy*: one
+place where idempotency, retries, misfires, and fairness live, so a
+thousand teams never have to re-derive them. When you frame a service as
+"a policy with an API", you sound like someone who has been on call.
+
 == Observability & SLOs
 
 The scheduler's vital sign is *fire lag*: `now − scheduled_time` at the
-moment of enqueue. Everything else is a leading indicator of lag.
+moment of enqueue. Everything else in the table is a leading indicator of
+lag — the signals that move *before* the user-visible number does. That
+framing is worth stating on your dashboard's first page, because it turns
+alerting from a list into a narrative: scan duration creeps, then queue
+depth grows, then lag breaches; the page you get at the first stage is a
+gift, the page at the last stage is a post-mortem invitation.
 
 #tbl(
   (0.95fr, 1.55fr, 1.15fr),
@@ -1002,15 +1385,30 @@ moment of enqueue. Everything else is a leading indicator of lag.
   ),
 )
 
-*SLOs.* Fire latency: p99 ≤ 1 s for one-shot jobs, ≤ 5 s for cron.
-Durability: registered jobs and accepted fire commands survive any single
-region loss. Failover: shard ownership moves in ≤ 15 s. Visible
-duplicates: ≈ 0 — dedup absorbs ≥ 99.99% of at-least-once redeliveries,
-and the remainder are reported, not hidden.
+Two rows reward a second look. *Lease flapping* is the canary for your
+timeout tuning: a takeover is cheap but not free — cold cache, rescan,
+ramp — and a few per day means your heartbeat interval is arguing with
+your GC pauses, an argument the timeout always loses. And the *retry/DLQ
+inflow* row encodes an organizational rule as a metric: a spike
+*attributed to one target* is that target's outage, so the alert should
+page its owner, not the scheduler's on-call. Routing blame correctly in
+the alert text is a kindness you do to your future colleagues.
+
+*SLOs.* Fire latency: p99 ≤ 1 s for one-shot jobs, ≤ 5 s for cron —
+different numbers because the consumers differ: a one-shot "remind me"
+has a human staring at it, while a cron job's consumer is a batch
+pipeline that cannot tell five seconds from five milliseconds. Durability:
+registered jobs and accepted fire commands survive any single region
+loss. Failover: shard ownership moves in ≤ 15 s. Visible duplicates:
+≈ 0 — dedup absorbs ≥ 99.99% of at-least-once redeliveries, and the
+remainder are *reported, not hidden*, because a duplicate you can see is
+a bug, and a duplicate you cannot see is a billing inquiry.
 
 == Interview Wrap-Up
 
-*Likely follow-ups, with the shape of a strong answer.*
+*Likely follow-ups, with the shape of a strong answer.* Each of these has
+a first sentence that carries most of the signal — find it, say it first,
+then elaborate.
 
 - _"But can you give me exactly-once?"_ No — and say why in one breath
   (the Two Generals: the worker that crashes after its side effect is
@@ -1038,11 +1436,11 @@ and the remainder are reported, not hidden.
   because this workload is write-dominated.
 
 *Checklist for the whiteboard.* (1) Split trigger vs firing vs execution
-  in the first five minutes. (2) Give the exactly-once speech unprompted.
-  (3) Put the index on `next_fire_at` and say "range scan, Chapter 8
-  style". (4) Draw the lease and its fencing token as separate things.
-  (5) Retry with jitter, dead-letter with redrive. (6) Splay the
-  top-of-hour herd. (7) Five tables, no more.
+in the first five minutes. (2) Give the exactly-once speech unprompted.
+(3) Put the index on `next_fire_at` and say "range scan, Chapter 8
+style". (4) Draw the lease and its fencing token as separate things.
+(5) Retry with jitter, dead-letter with redrive. (6) Splay the
+top-of-hour herd. (7) Five tables, no more.
 
 == Summary & Further Reading
 
@@ -1115,8 +1513,4 @@ explicit because the alternative is making it by accident at 3 AM.
 )
 
 #v(0.8em)
-#align(center)[
-  #text(size: 8.5pt, fill: slate)[
-    — End of Chapter 10 · Next: Chapter 11 —
-  ]
-]
+#align(center)[#text(size: 8.5pt, fill: slate)[— End of Chapter 10 · Next: Chapter 11, Designing for Correctness: How ACID Transactions Work —]]

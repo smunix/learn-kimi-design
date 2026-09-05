@@ -32,13 +32,20 @@ or 'controversial'. Popular posts get tens of thousands of comments, so users
 page through them and expand subtrees on demand. Design the system that
 stores, ranks, and serves these comment threads."_
 
-The previous chapters designed infrastructure; this one designs a
-*user-facing product surface* whose entire value is ordering: the same fifty
-thousand comments are useful or useless depending on which fifteen the reader
-sees first. Two hard problems hide inside — representing arbitrarily deep
-trees so that subtrees can be fetched and paged cheaply, and ranking votes in
-a way that is *statistically honest* and *time-aware* at write rates of
-thousands of votes per second.
+After Chapter 4's infrastructure marathon, this prompt feels pleasantly
+concrete — you have used this product; you can picture the indentation lines.
+Do not let the familiarity sedate you. The previous chapters designed
+systems whose value was *throughput* or *correctness*; this one's entire
+value is *ordering*. Think about what that means: the same fifty thousand
+comments, in one order, are a delightful conversation; in another order, an
+unreadable swamp. The product is the permutation. Two hard problems hide
+inside that observation, and the chapter is organized around them —
+representing arbitrarily deep trees so that subtrees can be fetched and
+paged cheaply, and ranking votes in a way that is *statistically honest* and
+*time-aware* while thousands of votes per second stream in. Notice what is
+*not* on that list: capacity. Storage here is trivial by Chapter 4's
+standards, which should make you suspicious that the interview is really
+about something else — it is.
 
 #defterm([Comment thread / tree])[
   The replies under one post form a _tree_: the post is the root context,
@@ -56,7 +63,21 @@ thousands of votes per second.
   design gets interesting.
 ]
 
+Pause on that tension, because it is the seed of the chapter's best
+interview moment. The *score* wants to be simple — one integer a user can
+watch tick upward. The *ranking* wants to be honest — and honesty, it turns
+out, requires statistics, because a comment with one upvote and a comment
+with two hundred upvotes and ten downvotes are not the same kind of object
+no matter how similar their scores might get. Section 5.8 is the machine
+that reconciles the two: the score stays simple for humans while the ranking
+gets to be smart for the product.
+
 == Scope & Clarifying Questions
+
+The prompt says "arbitrarily deep" and "tens of thousands" — two phrases
+that will dominate the design — but leaves almost everything else open. Run
+the negotiation; the table below compresses a longer conversation into its
+load-bearing answers:
 
 #tbl(
   (auto, 1fr),
@@ -74,6 +95,20 @@ thousands of votes per second.
   ),
 )
 
+Read the answers as a list of permissions, because several of them are
+quietly generous, and noticing *permissions* is as important as noting
+constraints. "No live push needed" frees you from WebSocket fleets and
+subscription fanout — the whole real-time machinery of Chapter 1 stays on
+the shelf. "Counts can lag a little" legalizes asynchronous counters, which
+Section 5.14 will cash in to keep comment writes off a hot post row. "Most
+reads are logged-out" is the single most valuable sentence in the table for
+your infrastructure bill: logged-out readers all see the *same* page, and
+identical pages are what caches eat for breakfast. And "deletes are soft,
+replies survive" is not a detail at all — it is the constraint that forces
+the tombstone design of Section 5.7, because you can no longer just `DELETE
+FROM comments` without orphaning a subtree of conversation other people are
+still having.
+
 #notebox([Agreed scope])[
   + *Post and reply* to arbitrary depth; soft-delete with surviving replies.
   + *Vote* up/down/retract; exactly one vote per user per comment.
@@ -88,6 +123,10 @@ thousands of votes per second.
 
 == Functional Requirements
 
+One definition first, because the four sort orders are the product's whole
+personality and you need their precise meanings before you can promise to
+build them:
+
 #defterm([Ranking mode])[
   One of the supported orderings of a thread's comments. _Top_: highest score.
   _New_: most recent first. _Best_: highest *statistical confidence* of being
@@ -95,6 +134,15 @@ thousands of votes per second.
   most balanced *and* voluminous disagreement. Each mode is a different pure
   function of the same vote data — an important honesty property.
 ]
+
+That last sentence deserves emphasis before the requirements list: four
+orderings, *one* dataset. There is no "best" flag in the database, no
+separate controversial tally — every mode is a deterministic function of
+`(up, down, created_utc)`. This is what makes the modes *consistent with
+each other* (a comment cannot be simultaneously excellent and terrible
+depending on which tab you view it through — only differently *sorted*), and
+it is what makes the write path tractable, because one vote update feeds all
+four rankings at once.
 
 + *FR-1 — Create.* Post a top-level comment on a post, or a reply to any
   existing comment, recording parent, author, timestamp, and body.
@@ -111,7 +159,21 @@ thousands of votes per second.
 + *FR-6 — Post-level counters.* Comment counts per post for listing pages,
   eventually consistent within seconds.
 
+Read FR-3 and FR-4 together and notice what they *don't* say: nowhere does
+anyone ask for "the thread." The product surface is a sequence of *windows*
+— a page of top-level comments, a burst of children, an expansion on demand
+— and that phrasing, which the scope dialogue's depth-collapse answer
+hinted at, is doing enormous work. A 50,000-comment thread is not a document
+to be transferred; it is a territory to be *explored* through a viewport.
+Every systems consequence you care about — cursor pagination, shallow
+children, collapse tokens — descends from reading the FRs as window-shaped
+rather than tree-shaped. Section 5.12's tip box will name this principle
+("window, don't tree"); watch for it forming here.
+
 == Non-Functional Requirements
+
+One definition before the table, because it names the single number that
+shapes this architecture more than any latency target:
 
 #defterm([Read-to-write ratio])[
   The proportion of read requests to write requests a system serves. It
@@ -120,6 +182,16 @@ thousands of votes per second.
   is amortized across thousands of reads. Comment systems are extreme —
   Section 5.5 derives roughly *35:1* on requests, and far higher on bytes.
 ]
+
+Hold the logic of that definition clearly, because it is an argument template
+you will reuse for the rest of your career: *the ratio licenses the
+asymmetry*. If reads outnumber writes 35:1, then any work you move from the
+read side to the write side is work done once instead of thirty-five times —
+precomputed rank keys, pre-rendered windows, denormalized tallies. You are
+not "over-engineering the write path"; you are investing where the return is
+35×. Watch for this pattern: Section 5.8 stores ranking as a column, and
+Section 5.12 caches rendered windows, and both are the ratio argument
+wearing different clothes.
 
 #tbl(
   (auto, 1fr),
@@ -136,15 +208,33 @@ thousands of votes per second.
   ),
 )
 
+Compare the durability row with Chapter 4 and say the contrast out loud in
+the interview — it proves the NFRs are *derived*, not recited. Chapter 4's
+metrics could shed samples under load because statistics tolerate gaps; a
+comment is someone's words, and losing it is a small but permanent betrayal
+of a human who trusted the text box. Same industry, opposite answer, because
+the *data's relationship to its owner* differs. Also savor the availability
+row's built-in degradation plan: "stale cache is acceptable" means a read
+outage and a write outage have different blast radii — if the write path
+dies, readers happily consume yesterday's rankings for hours; if the read
+path dies, the product is simply down. Protect the read path first.
+
 #insight([This is a *shape* problem, not a *size* problem])[
   Chapter 4 drowned in bytes (170 TB/day); this chapter stores ~30 GB/day —
   three orders of magnitude less. The difficulty is that the data is a forest
   of unbounded trees that must be *ranked four ways, paged stably, and
   re-ranked continuously* as votes arrive. Interviewers use this problem to
   test data modeling and algorithmic reasoning, not capacity arithmetic.
+  Recalibrate your instincts accordingly: the wins here come from schema and
+  statistics, and every minute you spend on sharding arithmetic past
+  Section 5.5 is a minute not spent where the interview is actually scored.
 ]
 
 == Back-of-the-Envelope Estimation
+
+The discipline continues even in a shape problem — because "shape, not size"
+is a conclusion you have to *earn* with numbers before you are allowed to
+believe it.
 
 *Assumptions* (stated, then derived from): 70M daily active users; 20% read
 comment threads, averaging 10 thread views; 1 in 35 thread readers writes a
@@ -165,13 +255,25 @@ average comment body ~500 bytes.
   ),
 )
 
+Three rows earn their keep immediately. The *comments written* and *votes
+cast* rows, read side by side, deliver the ratio insight: 230 comments/s
+versus 2,300 votes/s — the vote path is ten times hotter than the comment
+path, so Section 5.11 will spend its entire engineering budget there. The
+*hot cache* row says the entire working set of rendered first-pages fits in
+fifty gigabytes — one modest cache tier stands between a viral post and your
+database. And the *comment storage* row confirms the "shape not size"
+verdict: 11 TB a year is a rounding error against Chapter 4's 170 TB a
+*day*; nobody needs exotic storage here, they need correct modeling.
+
 #insight([Votes, not comments, are the write storm])[
   Comments arrive at ~230/s; *votes* at ~2.3k/s average and 12k/s peak — and
   each vote is a read-modify-write on *at least four* things: the voter's
   idempotency record, the comment's up/down tallies, the cached score, and
   eventually the ranked order. Naively, that is a hot-row update per vote on
   viral comments. The vote pipeline (Section 5.11) exists to make the busiest
-  path in the system also the cheapest.
+  path in the system also the cheapest. Remember Chapter 3's lesson while
+  you read it: a read-modify-write under concurrency is where races breed,
+  so the pipeline's first job is making that operation indivisible.
 ]
 
 The pipeline of the rest of the chapter: Section 5.6 isolates the two hard
@@ -181,22 +283,33 @@ implements all of it in Rust; 5.14–5.20 scale, harden, and review.
 
 == The Core Challenge: Trees and Honest Ordering
 
-Two problems carry this design, and neither is capacity.
+Two problems carry this design, and neither is capacity. Naming them
+precisely — and noticing that they are *independent*, solvable one at a time
+— is the first senior move of the interview.
 
 *Problem one — represent a forest of unbounded trees so that windows of it are
 cheap to read.* Every read asks a deceptively simple question: "give me
 top-level comments 41–60 by best, each with its first two levels of best
-children." A relational row per comment answers that badly unless the schema
-is designed for it; Section 5.7 compares the three classical tree encodings
-and picks a hybrid.
+children." Sit with that sentence and count the hazards inside it: there is
+a *ranked page* over a filtered subset (top-level only), a *subtree
+expansion* per page item, and a *depth budget* — three different tree
+operations fused into one user-visible response. A relational row per
+comment answers that badly unless the schema is designed for it; Section 5.7
+compares the three classical tree encodings and picks a hybrid.
 
-*Problem two — rank honestly.* "Best" cannot mean "highest score": a comment
-at +1 (1 up, 0 down) would outrank none and a comment at +190 (200 up, 10
-down) deserves to beat one at +2 (2 up, 0 down) — raw differences ignore
-*sample size*. Ranking must be a statistical statement about votes, plus a
-time statement (freshness), and it must be recomputed continuously as votes
-stream in. Section 5.8 derives the three functions used in production
-practice.
+*Problem two — rank honestly.* "Best" cannot mean "highest score", and the
+fastest way to see why is to play the adversary against yourself: a comment
+at +2 (2 up, 0 down) sits above a comment at +190 (200 up, 10 down) under
+raw-score ordering. Is that right? Your product sense says no — the second
+comment has survived two hundred independent judgments with a 95% approval
+rate; the first has survived two. But flip to the other naive answer, sorting
+by *ratio* of upvotes, and it fails just as embarrassingly in the opposite
+direction: 1/1 = 100% beats 200/210 ≈ 95%, so a comment one person liked
+outranks a comment two hundred people mostly loved. Raw difference ignores
+sample size; raw ratio worships it. Ranking must be a statistical statement
+about votes, plus a time statement (freshness), and it must be recomputed
+continuously as votes stream in. Section 5.8 derives the three functions
+used in production practice.
 
 #pitfall([Score is not rank])[
   Sorting "best" by `up − down` is the most common wrong answer in this
@@ -205,10 +318,17 @@ practice.
   never, yet *percentage* sorting fails oppositely: 1/1 = 100% beats
   200/210 = 95%). Both naive orders are statistically illiterate; the fix is
   a confidence bound (Section 5.8). Say this early in the interview — it is
-  the question the interviewer is waiting for.
+  the question the interviewer is waiting for, and volunteering it reads as
+  "has thought about ranking before" rather than "was caught by the standard
+  trap."
 ]
 
 == Data Model: Encoding Comment Trees
+
+Problem one first: how do you store a tree in a database that thinks in rows?
+This is a classic question with three classical answers, and the interview
+expects you to know all three well enough to *reject* two of them with
+reasons. So learn them as a set:
 
 #defterm([Adjacency list / materialized path / nested sets])[
   The three classical ways to store trees in a relational store. _Adjacency
@@ -222,6 +342,23 @@ practice.
   write rates.
 ]
 
+Build the intuition for each by asking the same question three ways: "given
+comment c42, find everything under it." Under *adjacency list*, you fetch
+c42's children, then each child's children, and so on — one query per
+generation, the N+1 trap in tree clothing. Under *materialized path*, c42's
+path is `/c1/c7/c42`, so its entire subtree is every row whose path starts
+with that prefix — one indexed range scan, done. Under *nested sets*, c42
+carries two numbers such that every descendant's numbers fall strictly
+inside them — also one range scan. So the two modern contenders both read
+subtrees beautifully. The difference only appears on *writes*, and there it
+is brutal: inserting a reply under nested sets requires shifting the `rgt`
+boundary of every ancestor and renumbering potentially half the forest,
+while a materialized-path insert writes one row whose path is just the
+parent's path plus its own id. Comments are write-heavy (230/s) and
+*append-only* — replies are never moved between parents in this product —
+so the encoding whose weakness is subtree moves gives up a weakness you
+never exercise.
+
 #tbl(
   (auto, 1fr, 1fr, 1fr),
   header: (hcell[Property], hcell[Adjacency list], hcell[Materialized path], hcell[Nested sets]),
@@ -234,6 +371,13 @@ practice.
     [Fit for comments], [Good bones], [*Best fit* — subtrees are read, rarely moved], [Unacceptable writes],
   ),
 )
+
+Read the last row as the verdict and the rows above it as the evidence. Then
+notice the hybrid hiding in plain sight: adjacency's `parent_id` is nearly
+free to keep alongside a materialized path, and it buys you the operations
+paths are bad at — "who is my direct parent?" for reply validation, "list my
+siblings" for certain expansions — without walking strings. Bones from one
+encoding, muscle from another.
 
 The chosen schema — adjacency bones, path muscle, denormalized tallies:
 
@@ -252,9 +396,23 @@ comments
   index (post_id, path)            -- serves every window query in Section 5.12
 ```
 
+Study the index line until it feels inevitable: `(post_id, path)` means
+"within one post, ordered by path" — and since a path is the ancestor chain,
+ordering by path *is* a depth-first traversal order. One index gives you
+top-level pages (path has one segment — or filter on the stored `depth`),
+subtree expansion (path prefix), and DFS ordering for rendering, all from a
+single B-tree. The schema is not a list of columns; it is a promise about
+which questions will be cheap.
+
 `votes` is a separate table keyed `(user_id, comment_id)` — the idempotency
 backbone of Section 5.11. A post's `comment_count` lives denormalized on the
-`posts` row, maintained asynchronously (FR-6).
+`posts` row, maintained asynchronously (FR-6). Keep the separation straight:
+`comments.up/down` are *derived display state* (fast to read, rebuilt by the
+pipeline), while `votes` is *ground truth* (the legal record of who voted
+what). Which table you trust in a dispute is a design decision; here the
+small, write-once-style table wins custody of truth, and the big, read-hot
+table is allowed to drift and be repaired. Section 5.11's reconciliation
+paragraph closes that loop.
 
 #defterm([Tombstone (soft delete)])[
   A deletion that erases content but keeps structure: body and author are
@@ -264,16 +422,33 @@ backbone of Section 5.11. A post's `comment_count` lives denormalized on the
   they may take the subtree with them per policy.
 ]
 
+The scope dialogue forced this on you ("replies survive"), but it is worth
+seeing that the requirement is also *good product*: conversations are shared
+artifacts, and letting one author vaporize the context of other people's
+words would make every heated thread self-destruct at its most interesting
+moment. The tombstone is the schema's opinion that a conversation belongs to
+its participants, not to any single speaker.
+
 == Deep Dive: The Ranking Mathematics
 
-Three pure functions over the same two integers (`up`, `down`) plus time.
-Each answers a different question honestly.
+Now problem two, and this section is the interview's centerpiece — the
+twenty minutes where you either recite rankings you have seen or derive
+rankings you understand. Three pure functions over the same two integers
+(`up`, `down`) plus time. Each answers a different question honestly, and
+learning to say *which question* each answers is worth more than the
+formulas.
 
 === "Top" and "New" — trivial orders
 
 `top` sorts by score `up − down` descending (ties by age, newest first);
 `new` sorts by `created_utc` descending. Both are indexable directly. Their
-weakness is statistical, which is exactly why "best" exists.
+weakness is statistical, which is exactly why "best" exists: `top` treats
++2 (two votes) and +190 (210 votes) as two points apart, and `new` ignores
+votes entirely. Neither is *wrong* — they are honest answers to questions
+nobody asked. Users did not ask "which comment has the largest arithmetic
+difference?"; they asked "which comments will I be glad I read?" Those are
+different questions, and the gap between them is where the next two
+functions live.
 
 === "Best" — the Wilson lower confidence bound
 
@@ -288,20 +463,47 @@ weakness is statistical, which is exactly why "best" exists.
   costs a few flops — computable at vote time and stored.
 ]
 
+Unpack the strategy, because the formula below is just the strategy frozen
+into arithmetic. You cannot know a comment's *true* quality `p`; you only
+have the votes so far. So instead of pretending `p̂` is the truth (ratio
+ranking's sin) or discarding the ratio entirely (score ranking's sin), you
+ask: "given this much evidence, what is the *lowest* `p` still consistent
+with the data at 95% confidence?" Rank by that pessimistic bound and two
+beautiful behaviors emerge for free: new comments with few votes are
+penalized in proportion to their uncertainty (so 1/1 no longer beats
+200/210 — the 1/1 bound is dragged toward zero by doubt), and as evidence
+accumulates the bound relaxes toward the observed ratio (so proven comments
+rise to exactly where their record deserves). You are not choosing between
+ratio and sample size; you are *charging each comment for its uncertainty*,
+and letting the charge evaporate as evidence arrives.
+
 $ "wilson"(u, d) = (hat(p) + z^2/(2n) - z sqrt((hat(p)(1-hat(p)) + z^2/(4n))/n)) / (1 + z^2/n), quad n = u+d, hat(p) = u\/n $
 
-The numbers that make the point: a comment with 1 up / 0 down scores ≈ 0.21;
-with 10 / 0, ≈ 0.72; with 100 / 0, ≈ 0.96. And 100 up / 100 down (p̂ = 50%
-but n = 200, ≈ 0.42) correctly beats 1 / 0 — volume of evidence matters more
-than a lone perfect record. Section 5.13 implements and tests exactly these.
+You will never need to derive this at the whiteboard; you need to be able to
+*interrogate* it. Three numbers do that job better than any derivation: a
+comment with 1 up / 0 down scores ≈ 0.21; with 10 / 0, ≈ 0.72; with 100 / 0,
+≈ 0.96. Same 100% approval, three wildly different ranks — that is the
+uncertainty charge, visible. And 100 up / 100 down (p̂ = 50% but n = 200, ≈
+0.42) correctly beats 1 / 0 — volume of evidence matters more than a lone
+perfect record. Section 5.13 implements and tests exactly these numbers, so
+if your memory of the formula blurs in the interview, reconstruct the
+behavior table and describe the curve; it lands the same.
 
 === "Controversial" — balanced disagreement, weighted by volume
 
 $ "controversial"(u, d) = cases(0 & "if" min(u,d) = 0, (u + d)^(min(u,d)\/max(u,d)) & "otherwise") $
 
-A 50/50 split on 100 votes (`balance` = 1, magnitude 100) crushes a
-105-vote comment with a 100/5 split (balance = 0.05 → magnitude ≈ 1.26):
-near-even splits dominate, and among equal splits the *louder* argument wins.
+Read the formula as a two-factor test, because both factors are necessary
+and neither is sufficient alone. The exponent `min/max` measures *balance*:
+it is 1 only for a perfect 50/50 split and decays toward 0 as the split
+lopsides, so one-sided comments are exponentially demoted. The base `u + d`
+measures *volume*: among equally balanced comments, the one with more total
+votes ranks higher. A 50/50 split on 100 votes (`balance` = 1, magnitude
+100) crushes a 105-vote comment with a 100/5 split (balance = 0.05 →
+magnitude ≈ 1.26): near-even splits dominate, and among equal splits the
+*louder* argument wins. Also notice the guard clause — zero on the weak
+side means zero controversy, because disagreement requires two camps, and a
+camp of zero is a monologue.
 
 === "Hot" — score with time decay (for posts and fast threads)
 
@@ -315,15 +517,36 @@ near-even splits dominate, and among equal splits the *louder* argument wins.
   gracefully instead of cliffing.
 ]
 
+Both halves of this formula are product decisions disguised as math, and
+naming them as such is the interview answer. The `log₁₀` term encodes
+*diminishing returns on popularity*: the jump from 1 to 10 votes moves the
+rank as much as 10 to 100, because early traction is the scarce signal that
+a submission is worth showing anyone. The linear age term encodes *front-page
+turnover*: every 12.5 hours costs one order of magnitude of score, so
+yesterday's thousand-vote story must be ten times as beloved as this
+morning's hundred-vote story to keep its slot — the front page renews itself
+on a schedule you can tune by changing one constant. Neither behavior is a
+law of nature; both are choices about what the product should feel like,
+frozen into arithmetic where they can be tested, tuned, and defended.
+
 #insight([Rank is a stored, recomputed column — not a query-time sort])[
   All four functions are pure over `(up, down, created_utc)`. So the vote
   pipeline recomputes a comment's rank keys *on every vote* and stores them;
   reads are then index scans, never sorts. "Best" order changes only when
   votes change — and votes arrive at 2.3k/s, exactly the pipeline built in
   Section 5.11. Sorting 50k comments per page-view would be malpractice.
+  Hold the general principle once you see it here: when a read asks for a
+  *function* of data that changes far more slowly than reads arrive, compute
+  the function on write and store the answer. You will meet this principle
+  again in Chapter 6's leaderboard and Chapter 7's recommendations — it may
+  be the single most reusable move in this book.
 ]
 
 == API Design
+
+Seven endpoints cover the whole product, and their shapes are all forced by
+decisions you have already made — read the table as a summary of the chapter
+so far rather than a new topic:
 
 #tbl(
   (auto, auto, 1fr),
@@ -339,18 +562,36 @@ near-even splits dominate, and among equal splits the *louder* argument wins.
   ),
 )
 
-Two deliberate choices:
+Two deliberate choices deserve their own paragraphs, because each is a
+famous trap disarmed in advance:
 
 - *Opaque cursors, never offsets.* A cursor encodes the last seen rank key
   and comment id (`base64(wilson, id)`); offsets break the moment a new
   comment inserts above the reader's position — Chapter 1's cursor lesson
-  applied to ranked lists. Ties are impossible: `(rank_key, comment_id)` is a
-  total order.
+  applied to ranked lists. Feel the failure mode concretely: a reader is on
+  page 2 (rows 21–40 by offset) when a burst of votes promotes three new
+  comments into the top 20; every offset shifts, and rows 21–40 now overlap
+  page 1 — the reader sees duplicates and silently *skips* three comments
+  they never knew existed. Cursor pagination cannot do this, because the
+  cursor names a *position in the ordering* ("everything after (0.94, c55)")
+  rather than a *count of rows to skip*, and positions stay meaningful as
+  the list churns. Ties are impossible: `(rank_key, comment_id)` is a total
+  order.
 - *Votes are `PUT`, not `POST`.* Repeating or flipping a vote is one
   idempotent operation on a `(user, comment)` resource, not an event stream
-  the client can double-fire. Retries are free.
+  the client can double-fire. Retries are free. This is FR-2's "exactly one
+  vote per user" enforced *at the protocol level*: the HTTP method itself
+  promises that sending the same request twice is safe, which licenses
+  clients to retry aggressively on flaky mobile networks — exactly the
+  networks your voters are on.
 
 == High-Level Architecture
+
+The pieces you have been assembling — a write path that must be idempotent,
+a ranking pipeline that recomputes continuously, a read path that serves
+cached windows — now assemble into one picture. Draw it in three horizontal
+bands: the edge at top, services in the middle, storage at the bottom, with
+the ranking pipeline as the connective tissue between write and read:
 
 #v(0.3em)
 #align(center)[
@@ -396,6 +637,56 @@ Two deliberate choices:
 ]]
 #v(0.2em)
 
+Now the walkthrough — and this diagram repays a careful narration, because
+its real content is not the boxes but *which paths are fast and which are
+allowed to lag*.
+
+Follow a *vote* first, since Section 5.5 told you it is the hottest write.
+The client (top-left) hits the API layer, which authenticates and validates;
+then the amber *rate limiter* — Chapter 3's design, recycled without
+modification — enforces per-user write caps, with the "writes throttled"
+label reminding you this is the first anti-brigading wall. From there the
+request descends to the *vote service* in the middle band. The vote service
+does two synchronous things, and the diagram's arrows show both: down to the
+*votes DB* (bottom-center-left) for the idempotent upsert that is the
+write's legal record, and down to the *event log* (teal, middle-low) to emit
+a `VoteChanged` event. Then — this is the crucial beat — the request
+*returns*. The user is not waiting for rankings; they are waiting only for
+two durable writes. Everything else happens behind them.
+
+Now follow the event, not the request. The teal arrow from event log to
+*rank updater* is the asynchronous handoff: the updater consumes vote
+events, coalesces bursts per comment, recomputes tallies and all four rank
+keys, and then fires the two arrows you see leaving it downward — one into
+the *comments DB* (writing the fresh tallies and rank keys back onto the
+comment rows, the "tallies" label marking where they land) and one long teal
+arrow sweeping left into the *thread cache*, version-stamping the affected
+post's windows so the next read repopulates. Study the shape of this loop:
+votes enter synchronously, rankings leave asynchronously, and the event log
+between them is Chapter 4's buffer lesson transplanted — spikes become lag,
+never loss.
+
+Follow a *read* now, and notice how short its path is. The *thread reader*
+service (middle-right) checks the *thread cache* for the requested
+`(post_id, sort, cursor)` window — the "cache fill" arrow runs from the
+reader down past the cache — and on a hit, which is nearly always, the
+response is already-rendered JSON. On a miss, the long slate arrow from the
+cache area back to the *comments DB* shows the fallback: run Section 5.12's
+two window queries against the shard that owns the post, render, cache,
+serve. The read path never touches the votes DB, never computes a Wilson
+score, never sorts anything — Section 5.8's "rank is a stored column"
+insight made visible as the *absence* of arrows.
+
+Two more elements complete the tour. The crimson *moderation* box at the
+right edge fires a dashed "removals" arrow across the whole diagram into the
+comment service: removals arrive on their own pipeline (designed by another
+team, per the scope) and must propagate to tombstone/removed states and then
+to caches within seconds — hence the arrow's path through, not around, the
+write side. And the comments DB label — "sharded by post_id" — encodes
+Section 5.14's key decision in the picture: one post's entire tree lives on
+one shard, so every window query you saw in the read path stays single-shard
+by construction.
+
 #tbl(
   (auto, 1fr, 1fr),
   header: (hcell[Component], hcell[Responsibility], hcell[Why it is shaped this way]),
@@ -413,11 +704,26 @@ Two deliberate choices:
   ),
 )
 
+Two rows articulate single-writer disciplines that keep the whole system
+sane. The comment service is *the only writer of `comments` rows* — so tree
+invariants (path equals parent's path plus id, depth equals segment count)
+have exactly one enforcer, and corruption has exactly one place to look. The
+vote service is the one writer of `votes` records — so idempotency rules
+live in one codebase, not in every client. Distributed systems rot when
+invariants are maintained by convention across many writers; they stay
+healthy when each invariant has a single gatekeeper. This diagram has two,
+and both are deliberate.
+
 == Deep Dive: The Vote Pipeline
 
-The busiest path in the system deserves the most engineering. Requirements:
-one vote per user (exactly), changeable, never lost, score visible in
-seconds, rank keys refreshed continuously.
+The busiest path in the system deserves the most engineering — Section 5.5
+proved the votes outnumber comments ten to one, so this is where the chapter
+spends its care. Requirements, restated as a checklist you can design
+against: one vote per user (exactly), changeable, never lost, score visible
+in seconds, rank keys refreshed continuously. The first requirement sounds
+like a business rule; it is actually a *concurrency* problem, because two
+simultaneous votes from the same user (double-tap on a laggy phone, retried
+request after a timeout) must not count twice.
 
 #defterm([Idempotent write / natural idempotency key])[
   A write that can be applied any number of times with the same effect.
@@ -427,6 +733,17 @@ seconds, rank keys refreshed continuously.
   pair, upserted, is the deduplication mechanism itself. No tokens, no
   expiry windows (contrast Chapter 3's idempotency keys on payment APIs).
 ]
+
+The phrase "the key is free" is the insight to carry away. Payment APIs need
+client-generated idempotency tokens because "charge this card" has no
+natural deduplication identity — two identical charges might both be
+legitimate. A vote is different: its *meaning* already includes its
+uniqueness constraint ("user 7's vote on comment 42" is one thing, not a
+count of things). When your write has a natural idempotency key, the
+database's unique constraint becomes your entire deduplication
+infrastructure. Train yourself to look for natural keys before reaching for
+token machinery; the best idempotency mechanism is the one that was always
+there.
 
 The write path for `PUT /v1/comments/c42/vote {value: -1}`:
 
@@ -454,6 +771,18 @@ The write path for `PUT /v1/comments/c42/vote {value: -1}`:
   Wilson/hot/controversial, writes them back, and *version-stamps* the thread
   cache so the next read repopulates.
 
+Walk the SQL once, because it is doing something subtle enough to deserve
+your respect. A naive vote update is two statements — "read the old vote,
+then write the new one" — which is precisely the check-then-act pattern
+Chapter 3's TOCTOU diagram destroyed: two concurrent flips by the same user
+could read the same old value and both mis-compute the tally delta. The
+statement above fuses read and write into one atomic upsert whose
+`RETURNING` clause hands back the *pre-update* value, so the caller learns
+"this user's previous vote was X, and now it is Y" as a single indivisible
+fact. The tally delta the rank updater needs — `(new==1) − (prev==1)` — is
+computable from that fact alone, which is why the event emitted in step 3
+carries both `prev` and `new`: the event is the delta, serialized.
+
 #insight([Coalescing is the whole trick])[
   A viral comment can take thousands of votes per minute, but its *rank key*
   only needs recomputing a few times a minute — readers cannot perceive
@@ -461,20 +790,30 @@ The write path for `PUT /v1/comments/c42/vote {value: -1}`:
   a stream to be compacted (latest-wins per user; batch-sum per comment)
   turns the hottest write path into a trickle of rank updates. The score
   users see may lag the truth by seconds — the agreed scope allows exactly
-  that, and spends the savings on reads.
+  that, and spends the savings on reads. Notice the pattern, because it is
+  the second time this book has used it: Chapter 4's buffer absorbed spikes
+  in *bytes*; this coalescer absorbs spikes in *recomputation*. Durable log
+  plus batching consumer is the universal shock absorber.
 ]
 
 *Reconciliation.* Tallies are derived state; `votes` is ground truth. A
 nightly job (and a per-comment repair tool) recomputes tallies from `votes`
-and fixes drift — the same discipline as Chapter 4's buffer replays: *derived
-numbers must be rebuildable from the event record.*
+and fixes drift — the same discipline as Chapter 4's buffer replays:
+*derived numbers must be rebuildable from the event record.* Say the
+principle in the interview before anyone asks, because it preempts the
+sharp follow-up ("what if a tally and the vote log disagree?") with a
+framework: you have already decided which store wins, how drift is detected,
+and how it heals. Systems that can answer "how would you know you're wrong?"
+are the ones that survive contact with production.
 
 == Deep Dive: Reading a Thread Window
 
-A thread read assembles a *window* of the tree: a page of top-level comments,
-each carrying its first levels of best children, with everything past the
-depth cap collapsed behind an affordance. With the schema of Section 5.7 the
-whole window is two queries:
+Everything so far — the hybrid schema, the stored rank keys, the vote
+pipeline — converges on the read path, and here you get to collect the
+dividends. A thread read assembles a *window* of the tree: a page of
+top-level comments, each carrying its first levels of best children, with
+everything past the depth cap collapsed behind an affordance. With the
+schema of Section 5.7 the whole window is two queries:
 
 + *Top-level page*: `WHERE post_id = $1 AND depth = 1 ORDER BY rank_key DESC,
   comment_id DESC LIMIT $2` with the cursor supplying the rank-key boundary —
@@ -485,10 +824,23 @@ whole window is two queries:
   on the page" into *one* query instead of N recursive ones (the N+1 that
   sinks the naive adjacency-list design).
 
+Count the queries: two, constant, regardless of how many parents the page
+contains or how deep the forest runs. That is the materialized path earning
+its storage cost — the same operation under a pure adjacency list is one
+recursive walk *per parent*, and the interviewer has seen a hundred
+candidates discover this in production. Also note the `depth <= 4` clause
+working alongside the depth column: the collapse rule from the scope
+dialogue is enforced *in the query*, not in application code, so the
+database never reads a row the UI will never render.
+
 Assembly is in memory: parents in rank order, children nested under them by
 path prefix, tombstones rendered as "[deleted]" placeholders, subtrees beyond
 depth 10 replaced by a `{continue_thread: comment_id}` token the client
 expands through `/children` (FR-4).
+
+Here is the assembled window drawn as the user experiences it — one post,
+its best conversation, and all three of the design's surgical instruments
+(ranking, tombstoning, collapse) visible at once:
 
 #v(0.3em)
 #align(center)[
@@ -512,6 +864,31 @@ expands through `/children` (FR-4).
 ]]
 #v(0.2em)
 
+Take the tour top to bottom. The post node at the top carries its
+denormalized `comment_count: 51 203` — FR-6's asynchronous counter, good
+enough for display precisely because the scope said "seconds stale, never
+lost." Two slate arrows descend from it to the page's two top-level
+comments, and the left branch tells the design's whole story in three boxes.
+First, *c41*, the best top-level comment: its label shows the stored rank
+key (wilson 0.96) and the visible score (+2.1k) — the two consumers of
+Section 5.1's vote data, side by side, finally reconciled. Below and
+indented, its best reply *c87* (wilson 0.91) — the shallow-children fill,
+one level of conversation context included so the reader can feel the
+thread's texture without loading it. Below that, *c102* rendered as
+"[deleted]": the tombstone, still occupying its structural slot so that
+c102's own replies (off-screen below) keep a parent to hang from. The right
+branch shows the other two instruments: *c55*, the second top-level comment,
+with its child *c90* collapsed into an amber affordance labeled "+ 1 812
+replies" — the depth/breadth budget made visible, one box standing in for a
+subtree larger than most websites' entire databases. And at the far right,
+the dashed teal arrow leads to the cursor box: `after (0.94, c55)` — the
+next page's starting position encoded as a (rank key, id) pair, immune to
+the vote churn that would corrupt an offset.
+
+Look at what the picture proves: a reader can scroll a 51,203-comment thread
+forever, and every page they ever request is two indexed queries against one
+shard, mostly served from cache. *That* is what all the mathematics bought.
+
 *Caching.* The rendered window JSON is cached under `(post_id, sort, cursor)`
 for logged-out readers — the majority (Section 5.2) — and the rank updater
 *version-stamps* the post on every coalesced update, so stale windows age out
@@ -519,6 +896,19 @@ within seconds without any invalidation fanout. Logged-in readers get the
 same window plus a per-user vote overlay (`SELECT comment_id, value FROM
 votes WHERE user_id = $1 AND comment_id = ANY(...)`) merged at read time —
 personalization over a shared cache, instead of a cache per user.
+
+The overlay pattern deserves a pause, because it dissolves a dilemma that
+otherwise eats designs like this. Votes make every user's view *personal* —
+you see your own upvotes highlighted — and naive personalization multiplies
+cache entries by user count, destroying the cache entirely. The overlay
+splits the response into the expensive shared part (the rendered window:
+bodies, structure, scores — identical for everyone) and the cheap personal
+part (your votes on the visible comments — a handful of rows fetched by a
+primary key lookup). Shared part cached once for the world; personal part
+fetched fresh per user. The general move — *separate the response into
+shared skeleton and personal overlay, cache only the skeleton* — applies to
+feeds, timelines, and dashboards everywhere, and interviewers recognize it
+as a mark of someone who has actually scaled a read path.
 
 #tip([Window, don't tree])[
   The API never returns "the thread" — only windows: ranked top-level pages,
@@ -531,7 +921,10 @@ personalization over a shared cache, instead of a cache per user.
 == Rust Reference Implementations
 
 Four pieces with deterministic tests: the ranking trio, the tree model with
-windowing, the idempotent vote service, and cursor pagination.
+windowing, the idempotent vote service, and cursor pagination. Each is the
+executable proof of a claim you have already made in prose — Section 5.8's
+statistics, Section 5.7's tree encoding, Section 5.11's idempotency, and
+Section 5.9's cursor stability — so read them as evidence, not as appendix.
 
 === The Ranking Functions
 
@@ -612,6 +1005,17 @@ mod ranking_tests {
     }
 }
 ```
+
+Notice how the tests encode *opinions*, not just arithmetic. The second
+Wilson test is named `wilson_prefers_proven_mediocre_to_lucky_perfect` —
+that name is the entire Section 5.8 argument compressed into an identifier,
+and the assertion `proven > wilson_lower(1, 0)` is the sentence "evidence
+beats luck" with a compiler behind it. The hot-ranking test asserts the
+12.5-hour exchange rate *exactly* (equality within 1e-9): one order of
+magnitude of score buys precisely one decay period of age, no more, no less
+— if someone "tunes" the constant from 45,000 to 44,000, this test fails
+loudly instead of letting the front page quietly age faster. Tests like
+these are how product decisions survive refactors.
 
 === The Tree Model: Paths, Depth, Tombstones
 
@@ -732,6 +1136,19 @@ mod tree_tests {
 }
 ```
 
+The `flatten_thread` function is worth one careful read because it answers a
+question every tree-rendering system faces: how do you turn a pile of rows
+into a depth-first *display order* without recursion blowing the stack on a
+10⁴-deep chain? The answer here is an explicit `Vec` used as a stack —
+recursion converted to iteration, with children pushed in reverse so they
+pop in ranked order. The sibling sort has three keys, and the third
+(`.then(a.id.cmp(&b.id))`) is the one candidates forget: score ties broken
+by recency can *still* tie, and a sort without a total order is a sort whose
+output can differ between runs — which means cursors over it can skip or
+repeat rows. The comment says it: "total order: no ambiguity." And the
+tombstone test locks in Section 5.7's contract: the body is hidden, the
+child survives, the thread's shape outlives any single comment's content.
+
 === The Idempotent Vote Service
 
 ```rust
@@ -783,6 +1200,18 @@ mod vote_tests {
     }
 }
 ```
+
+The whole vote pipeline's correctness lives in the four-line `delta`
+closure, so make sure you can narrate it. Every vote event reduces to two
+integers — how much `up` changed, how much `down` changed — computed by
+comparing the previous stored value with the new one. A retry of the same
+vote yields `(0, 0)` and the tallies do not twitch; a flip from up to down
+yields `(-1, +1)`, which is why the comment notes the score swings by *two*
+— flipping is not removing, it is defecting to the other camp. And the
+second test demonstrates the property that makes reconciliation possible:
+folding the emitted deltas reproduces the true tallies exactly, which is
+Section 5.11's "derived numbers must be rebuildable from the event record,"
+proven in seven lines.
 
 === Cursor Pagination over a Ranked List
 
@@ -864,7 +1293,24 @@ mod page_tests {
 }
 ```
 
+Two details here reward a second look. The `ordered_bits` function solves a
+problem you only discover when you try to store float ranks in systems that
+sort *bytes*: IEEE-754 floats do not sort correctly as unsigned integers
+once negatives appear (their sign bit flips the wrong way). The transform —
+flip the sign bit for non-negatives, complement everything for negatives —
+maps floats to u64s whose plain integer order matches the float order, so
+Wilson scores can live in B-tree indexes and base64 cursors without any
+float-awareness downstream. And the final test's assertion list is a
+checklist of everything pagination can get wrong: every item appears exactly
+once (no skips, no duplicates), the cursor equals the page's last item, and
+exhaustion is signaled by `None` rather than by an empty page — three
+different bugs, three assertions, one permanent guard.
+
 == Scaling the Platform
+
+The scaling story here is refreshingly one-dimensional — everything hinges
+on the shard key, so choose it the way Section 3.14 taught you: by asking
+which entity every hot operation is scoped to.
 
 #tbl(
   (auto, 1fr, 1fr),
@@ -879,6 +1325,17 @@ mod page_tests {
   ),
 )
 
+Notice that the two databases shard on *different* keys, and be ready to
+defend the asymmetry — it looks inconsistent and is actually precise.
+Comments shard by `post_id` because every comment query is scoped to one
+post's thread. Votes shard by `comment_id` because every vote operation is
+scoped to one comment, and tally locality matters more than user history
+(the per-user vote overlay is one small `ANY(...)` lookup per read, served
+by a secondary index). Each table shards on the key its *hot path* filters
+by; the cold path pays the secondary-index tax. That is the entire principle:
+you get to choose one cheap direction per table, so spend it on the path
+that runs a thousand times more often.
+
 #insight([The viral-post problem is a cache problem, not a database problem])[
   A post that makes the front page concentrates a meaningful share of the
   *entire site's* read QPS onto one shard's rows. Sharding cannot help — one
@@ -886,7 +1343,10 @@ mod page_tests {
   millions of reads between version stamps), read replicas of the hot shard
   for cache misses, and coalesced rank updates so the vote storm does not
   translate into row-write storms. Measure success as *origin QPS during a
-  viral event* staying flat.
+  viral event* staying flat. The broader lesson generalizes: when load
+  concentrates on one *key*, your tools are caching, replication, and write
+  coalescing — resharding a hot key does nothing, because the key's heat
+  moves with it.
 ]
 
 == Failure Modes & Degradation
@@ -905,6 +1365,18 @@ mod page_tests {
   ),
 )
 
+Read the degraded modes and notice how deliberately each one picks *which
+property to sacrifice*. Rank updater lag sacrifices *freshness* (stale
+order) to protect availability — the product blurs, never breaks. Votes DB
+loss sacrifices *write availability* (fail closed) to protect integrity —
+because a vote that is queued and retried is recoverable, while a vote
+silently dropped is a lie the system told its user. Replica lag sacrifices
+*everyone else's view* (stale) while routing the one user who would notice
+— the author — to the primary. Failure engineering is triage: you cannot
+save every property in every failure, so you decide in advance which
+property each failure is *allowed* to wound, and you write it down where a
+reviewer can argue with it.
+
 == Trade-offs & Alternatives
 
 #tbl(
@@ -921,6 +1393,17 @@ mod page_tests {
     [Comment count on posts], [Async maintained counter], [Synchronous increment on the post row: every comment write contends on one hot row — the exact anti-pattern Section 5.5 warned about],
   ),
 )
+
+The "Best" ranking row deserves one more breath, because its rejected
+alternative is not obviously wrong: a Bayesian average (blend each comment's
+ratio toward the global mean, weighted by sample size) is statistically
+respectable and some real platforms use it. Why Wilson instead? Two reasons
+you can say aloud: Wilson needs no *prior* — the Bayesian version imports a
+global average that must be estimated, versioned, and defended — and Wilson
+has a one-sentence explanation a product manager can repeat ("we rank by
+how good a comment *at least probably* is"), which matters when the ranking
+function has to survive meetings, not just mathematics. Choose the
+statistic your organization can govern.
 
 == Observability & SLOs
 
@@ -943,7 +1426,11 @@ Every one of these is a metric with labels and an alert with a `for` duration
 — Chapter 4's platform, pointed at this chapter's system. The reconciliation
 job emits tally-drift as a metric; brigading detection is a velocity alert on
 votes per thread. The book's chapters compose, and saying so in the interview
-is a senior signal.
+is a senior signal. Notice also which SLO is *not* in the table: there is no
+"rank accuracy" target, because rank keys are a pure function of vote state —
+correctness there is enforced by construction and tested in Section 5.13, not
+measured at runtime. The best SLOs are the ones the architecture makes
+unnecessary.
 
 == Interview Wrap-Up
 
@@ -954,11 +1441,15 @@ Likely follow-ups and the shape of strong answers:
   log fans `CommentCreated` events to gateways. Key decision: live comments
   arrive *appended* (by time), not re-sorted — re-ranking a live view under
   the reader's eyes is a product bug; re-sort applies on next window load.
+  (A comment that leaps over three others mid-read is the UI equivalent of
+  someone rearranging a book while you read it.)
 + *"How do you detect vote manipulation?"* Signals: velocity anomalies on
   single threads, account-age and IP clustering of voters, vote-ring graph
   analysis (accounts that only vote each other). Enforcement: shadow-exclude
   flagged votes from *rank keys* while keeping them in the visible score —
-  manipulation loses its feedback signal.
+  manipulation loses its feedback signal. That last move is the elegant one:
+  a manipulator who cannot observe their own effect cannot tune their
+  attack.
 + *"Users edit comments to bait-and-switch after they rank."* Keep edit
   history; reset or decay a comment's rank confidence on substantive edits
   (re-open the Wilson interval); show "edited" markers. Ranking trust is the
@@ -1006,6 +1497,10 @@ Likely follow-ups and the shape of strong answers:
 
 == Chapter Glossary
 
+Every term this chapter defined, gathered for review — read the list once
+through before moving on, because Chapters 6 and 7 will reuse the ranking
+vocabulary without re-deriving it.
+
 #tbl(
   (auto, 1fr),
   header: (hcell[Term], hcell[Meaning]),
@@ -1040,6 +1535,6 @@ Likely follow-ups and the shape of strong answers:
 #v(0.8em)
 #align(center)[
   #text(size: 8.5pt, fill: slate)[
-    — End of Chapter 5 · Next: Chapter 6—
+    — End of Chapter 5 · Next: Chapter 6, Designing a Real-Time Leaderboard —
   ]
 ]

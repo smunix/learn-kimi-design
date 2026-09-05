@@ -17,16 +17,18 @@
   from the series _Systems Design Interview Questions With Ex-Google SWE_ (channel:
   _Jordan has no life_, 2024, 35 min). The talk designs a mapping and navigation
   product: how the map itself is served, how the road network becomes a graph, how
-  routes and ETAs are computed, and how live traffic feeds back into both. This
-  chapter follows the same arc, deepened with full definitions, capacity
-  mathematics, protocol specifications, and Rust reference implementations.
+  routes and ETAs are computed, and how live traffic feeds back into both. We
+  follow the same arc here, slowing every step down: full definitions before first
+  use, capacity mathematics with every assumption stated, protocol specifications,
+  and Rust reference implementations of the pieces an interviewer is most likely
+  to ask you to sketch.
 ]
 
 #v(0.4em)
 
 == The Problem Statement
 
-The interviewer looks up and says:
+The interviewer finishes the small talk and says:
 
 #block(inset: (left: 14pt), stroke: (left: 2pt + primary), above: 0.9em, below: 0.9em)[
   #text(style: "italic", size: 10.5pt)[
@@ -37,29 +39,41 @@ The interviewer looks up and says:
 ]
 
 Where Chapter 1's problem hid its difficulty behind a familiar CRUD interface,
-this one hides its difficulty behind a familiar _picture_. A map feels like
-content — something you serve, like an image. Directions feel like a lookup —
-something you query, like a database. Neither is true. The map is a planet-sized
-rendering problem, directions are a graph algorithm running at planetary scale,
-and "current traffic" means the system's answers change *under you every few
-minutes*, driven by a firehose of GPS signals from millions of moving phones.
-Three genuinely hard subsystems — geospatial serving, large-scale graph search,
-and real-time stream processing — share one interview.
+this one hides its difficulty behind a familiar _picture_ — and that makes it
+dangerous in a different way. A map *feels* like content: something you serve,
+like an image on a website. Directions *feel* like a lookup: something you query,
+like a row in a database. If you follow those feelings, you will design a file
+server and a database, and both designs will be wrong. The map is a planet-sized
+rendering and caching problem. Directions are a graph algorithm running at
+planetary scale. And "current traffic" means the system's answers change *under
+you, every few minutes*, driven by a firehose of GPS signals from millions of
+moving phones. Three genuinely hard subsystems — geospatial serving, large-scale
+graph search, and real-time stream processing — share one interview prompt, and
+part of what the interviewer is measuring is whether you notice all three.
+
+One term will appear in every section of this chapter, so let us define it
+before anything else:
 
 #defterm([ETA (estimated time of arrival)])[
   The system's prediction of how long a journey from A to B will take, usually
-  expressed as a duration or an arrival clock time. An ETA is a *prediction*, not
-  a measurement: it must be computed before the journey happens, from a model of
-  the road network plus everything currently known about conditions on it. ETA
-  accuracy is the quality bar this whole chapter is judged against — Section 2.4
-  makes it a formal requirement and Section 2.18 shows how to measure it.
+  expressed either as a duration ("47 minutes") or as an arrival clock time
+  ("arrive 6:15 PM"). The word *prediction* is doing the work in that sentence:
+  an ETA must be computed *before* the journey happens, from a model of the road
+  network plus everything currently known about conditions on it — and it will be
+  compared, by every user, against the reality that follows. ETA accuracy is the
+  quality bar this whole chapter is judged against; Section 2.4 makes it a formal
+  requirement and Section 2.18 shows how to measure it honestly.
 ]
 
 == Scope & Clarifying Questions
 
-Never design the prompt you were handed; design the prompt you *negotiated*.
-Google Maps is a dozen products wearing one icon, so the first job is to shrink
-it. A strong opening exchange looks like this:
+Chapter 1 gave you the rule — never design the prompt you were handed; design
+the prompt you *negotiated* — and this prompt needs it more than most, because
+Google Maps is a dozen products wearing one icon. Map rendering, place search,
+directions, turn-by-turn navigation, live traffic, Street View, satellite
+imagery, transit schedules, offline maps, business listings, reviews… If you try
+to design all of that, you will design none of it well. So the first job is to
+shrink it, out loud, with the interviewer's help:
 
 #tbl(
   (auto, 1fr),
@@ -80,6 +94,16 @@ it. A strong opening exchange looks like this:
   ),
 )
 
+Before we freeze the scope, look at what two of these questions quietly bought.
+The *feature-list* question did not just trim scope — it established that the
+interviewer will let you treat a giant product as a menu, which is the correct
+posture for every "design X" prompt where X is a mature product. And the
+question about *GPS reporting* is the single most valuable line in the exchange:
+without phone-reported positions there is no live traffic, and without live
+traffic the prompt collapses into "serve static files and run Dijkstra." One
+question about *inputs* unlocked the most interesting subsystem of the entire
+design. (The tip box below generalizes this.)
+
 #block(fill: faint-blue, radius: 6pt, inset: (x: 14pt, y: 10pt), width: 100%)[
   #set text(size: 9.2pt)
   #text(font: ("Noto Sans", "DejaVu Sans"), size: 8pt, weight: "bold", fill: primary, tracking: 0.1em)[AGREED SCOPE]
@@ -92,47 +116,66 @@ it. A strong opening exchange looks like this:
 ]
 
 #tip([Ask where the data comes from])[
-  Most candidates ask about users and features; few ask *"what data do we get to
-  see?"* That single question unlocks this entire problem: the answer (GPS
-  updates from phones) is what makes live traffic possible at all. In a real
-  interview, the questions that reveal *inputs* are worth as much as the
-  questions that reveal *scale*.
+  Most candidates ask about users and features; very few ask *"what data do we
+  get to see?"* That single question unlocks this entire problem: the answer —
+  GPS updates from phones, every few seconds, with consent — is what makes live
+  traffic possible at all. In a real interview, the questions that reveal
+  *inputs* are worth as much as the questions that reveal *scale*, and they are
+  rarer, which makes them more memorable.
 ]
 
 == Functional Requirements
 
 Chapter 1 defined functional and non-functional requirements; recall that FRs
-are what the system must *do*. Our scoped functional requirements:
+are what the system must *do* — observable behaviors, testable without knowing
+the implementation. Here are ours, with a sentence each about where its
+difficulty hides:
 
 + *FR-1 — Map rendering.* The user can view an interactive map of the world and
   pan and zoom it smoothly, from a whole-planet view down to individual streets.
+  Sounds like serving images; is actually a planetary caching problem
+  (Section 2.6).
 + *FR-2 — Place search.* The user can find places by name, address, or category
-  ("coffee near me") and see them on the map.
+  ("coffee near me") and see them on the map. Sounds like text search; is
+  actually text search *intersected with geography*, which is the interesting
+  part (Section 2.9).
 + *FR-3 — Directions.* The user can request a route between two points and
   receives a good route: distance, step-by-step instructions, and a path drawn
-  on the map.
+  on the map. This is the graph algorithm (Section 2.8).
 + *FR-4 — ETA.* Every route comes with a travel-time estimate that reflects
-  *current* conditions, not just speed limits.
+  *current* conditions, not just speed limits. This requirement is what forces
+  routing and traffic to be one mechanism rather than two (Section 2.7).
 + *FR-5 — Turn-by-turn navigation.* The user can start a navigation session and
-  receives timely spoken/visual instructions, a live ETA that updates en route,
-  and an automatic new route if they stray from the planned path.
-+ *FR-6 — Traffic overlay.* The map shows current congestion (green/yellow/red)
-  on roads, fresh to within a few minutes.
+  receives timely spoken and visual instructions, a live ETA that updates en
+  route, and an automatic new route if they stray. This is the only stateful,
+  session-oriented requirement — and therefore the one with the strict
+  availability target (Section 2.13).
++ *FR-6 — Traffic overlay.* The map shows current congestion (green, yellow,
+  red) on roads, fresh to within a few minutes. The visible tip of the streaming
+  pipeline (Section 2.12).
 
-Out of scope, stated explicitly: Street View and satellite imagery, public
-transit timetables, offline maps, business-owner tooling, and social features.
+Out of scope, stated explicitly so nobody can ambush us with them at minute
+fifty: Street View and satellite imagery, public transit timetables, offline
+maps, business-owner tooling, and social features.
 
 == Non-Functional Requirements
+
+This problem has one NFR that Chapter 1 never needed, and it is the one that
+turns the design into a streaming system — so let us define it before the
+target table.
 
 #defterm([Freshness])[
   The age of the information behind an answer, measured from when reality
   changed to when the system's output reflects it. A traffic overlay that shows
   speeds from an hour ago is *stale*; our target is that any road's displayed
-  condition reflects measurements from the last few minutes. Freshness is the
-  NFR that makes this problem a *streaming* system rather than a static one.
+  condition reflects measurements from the last few minutes. Freshness is
+  different from latency: latency asks "how fast do you answer?", freshness asks
+  "how new is the answer's evidence?" A system can be fast and stale, or slow
+  and fresh. It is the freshness requirement — not any throughput number — that
+  makes this problem a *streaming* system rather than a static one.
 ]
 
-Four qualities dominate, stated as targets:
+The full set, stated as targets we can design and measure against:
 
 #tbl(
   (auto, 1fr),
@@ -148,29 +191,35 @@ Four qualities dominate, stated as targets:
 )
 
 #insight([Different subsystems, different NFRs])[
-  Notice that "the system" has no single latency or availability number. Tile
-  serving is a massive, cacheable *read* workload where 100 ms matters and a
-  stale tile is harmless. Routing is a *compute* workload where one second is
-  generous but the algorithm must be exact. The traffic pipeline is a *write*
-  workload where a few minutes of lag degrade quality, not correctness. Saying
-  "it depends which plane you mean" — and then naming the planes — is a senior
-  answer. Chapter 1 drew the same lesson with its control plane / data plane
-  split.
+  Run your eye down that table and notice that "the system" has no single
+  latency or availability number — and cannot have one, because its parts want
+  opposite things. Tile serving is a massive, cacheable *read* workload where
+  100 ms matters and a stale tile is harmless. Routing is a *compute* workload
+  where one second is generous but the algorithm must be exact. The traffic
+  pipeline is a *write* workload where a few minutes of lag degrade quality, not
+  correctness. And navigation is a *session* workload where availability is a
+  safety property. If an interviewer presses you for "the availability target,"
+  the senior answer is: "it depends which plane you mean" — followed by the
+  planes. Chapter 1 drew the same lesson with its control plane / data plane
+  split; this chapter splits further.
 ]
 
 == Back-of-the-Envelope Estimation
 
-Chapter 1 defined back-of-the-envelope estimation; the discipline is identical —
-state assumptions, write them down, invite correction.
+Chapter 1 taught the discipline — state assumptions, write them down, invite
+correction — and it is identical here. What changes is *where* the numbers will
+surprise you: in this problem the read path, the compute path, and the write
+path each have their own scale story, and they point at three different
+architectures.
 
 *Assumptions:*
 
-- 1B MAU, ~200M DAU. Each daily user views ~60 map tiles worth of panning,
+- 1B MAU, ~200M DAU. Each daily user views ~60 map tiles' worth of panning,
   searches ~2 places, and requests ~3 routes per day.
 - 15M concurrent navigation sessions at peak; each phone uploads one GPS update
-  every ~5 seconds while navigating; one update ≈ 150 bytes on the wire.
+  every ~5 seconds while navigating; one update is ~150 bytes on the wire.
 - The world's routable road network is on the order of *300 million directed
-  edges* (two directions per road piece, worldwide).
+  edges* (two directions per piece of road, worldwide).
 - A raster map tile averages ~20 KB; the world is mapped at zoom levels 0–20.
 
 *Derived numbers:*
@@ -190,33 +239,43 @@ state assumptions, write them down, invite correction.
 )
 
 #insight([What the math tells us])[
-  Three conclusions drive everything that follows. First, tile traffic is
-  enormous but *the content barely changes* — a perfect caching workload;
-  Section 2.6 exists to make 95%+ of those 700k QPS vanish into a CDN. Second,
-  the road graph (~20 GB) fits in the RAM of a handful of machines, so routing
-  is an *in-memory* problem — but 20k route QPS × ~3 CPU-seconds for a naive
-  shortest-path search would need *60,000 CPU cores*, which no fleet absorbs;
-  Section 2.8's whole purpose is to shave those 3 seconds down to ~1
-  millisecond, at which point ~20 cores suffice. Third, 3M GPS updates per
-  second is far too much for any request/response design — it demands a
-  streaming pipeline, which Section 2.12 builds.
+  Three conclusions drive everything that follows, and each one pre-answers a
+  later section. First, tile traffic is enormous — 700k requests per second at
+  peak — but *the content barely changes*, which makes it the textbook caching
+  workload; Section 2.6 exists to make 95%+ of those requests vanish into a CDN
+  before they ever touch us. Second, the road graph is only ~20 GB: it fits in
+  the RAM of a handful of machines, so routing is an *in-memory* problem. But —
+  and this is the arithmetic that justifies the chapter's most famous section —
+  20k route QPS multiplied by ~3 CPU-seconds for a naive shortest-path search
+  would demand *60,000 CPU cores*, which no fleet absorbs. Section 2.8's whole
+  purpose is to shave those 3 seconds down to ~1 millisecond, at which point
+  ~20 cores suffice. Third, 3M GPS updates per second is far too much for any
+  request/response design; it demands a streaming pipeline, which Section 2.12
+  builds. Read-heavy caching, in-memory compute, streaming writes: three
+  subsystems, three shapes, one product.
 ]
 
 == Core Challenge I: Serving the Map
 
-A user opens the app and sees their city. They drag the map; new streets slide
-in. They pinch; the view dives from the whole country to one neighborhood. Each
-of those moments requires the *right piece of the planet, rendered, in tens of
-milliseconds*. Rendering the world on the fly for every gesture of 200 million
-daily users is impossible; the entire solution rests on one idea: *precompute
-the map as tiny, independently addressable squares, and cache them everywhere.*
+Let us start with the thing the user actually sees. Someone opens the app and
+looks at their city. They drag the map; new streets slide in. They pinch; the
+view dives from the whole country to one neighborhood. Now think about what
+each of those gestures *demands*: the right piece of the planet, rendered, on a
+glass screen, in tens of milliseconds — for 200 million people a day. Rendering
+the world on the fly for every gesture is out of the question; no fleet of
+renderers survives 700k requests per second at 100 ms each. The entire solution
+rests on one idea, and everything in this section is an unfolding of it:
+*precompute the map as tiny, independently addressable squares, and cache those
+squares everywhere.*
 
 #defterm([Map tile])[
-  A small, fixed-size square of the map — conventionally 256×256 pixels (as an
-  image) or the equivalent bundle of geometry (as data) — covering a specific
+  A small, fixed-size square of the map — conventionally 256×256 pixels as an
+  image, or the equivalent bundle of geometry as data — covering a specific
   rectangular patch of the Earth's surface. A screen full of map is assembled
-  from a grid of tiles, like mosaic pieces. Tiles are the unit of storage,
-  caching, and transfer for every mainstream map service.
+  from a grid of tiles, like mosaic pieces laid edge to edge. Tiles are the
+  unit of storage, of caching, and of transfer for every mainstream map
+  service: the server thinks in tiles, the cache thinks in tiles, and the
+  client assembles tiles.
 ]
 
 #defterm([Zoom level])[
@@ -225,21 +284,26 @@ the map as tiny, independently addressable squares, and cache them everywhere.*
   children, so zoom _z_ has $2^z$ tiles per axis and $4^z$ tiles in total.
   Zoom 5 is roughly a country; zoom 10 a city; zoom 15 a neighborhood; zoom 20
   shows a patch about 38 meters wide at the equator — individual buildings.
+  The powers of four matter: they are why the total tile count explodes, and
+  the explosion is what the storage section below must tame.
 ]
 
 #defterm([Slippy-map tiling scheme])[
-  The near-universal convention for addressing tiles: every tile is identified
-  by three integers *(z, x, y)* — its zoom level and its grid coordinates,
-  counted from the top-left of the world. The Earth's surface is first
-  flattened with the Web Mercator projection (which maps the sphere to a square
-  and caps latitude near ±85.05°), then cut into the $2^z times 2^z$ grid.
-  Given a latitude/longitude and a zoom, *anyone can compute which tile
-  contains it* with a closed-form formula — Section 2.14 implements it. The
-  addressing is deterministic, so the client never asks the server "which tiles
-  do I need?"; it already knows.
+  The near-universal convention for *addressing* tiles: every tile is
+  identified by three integers *(z, x, y)* — its zoom level and its grid
+  coordinates, counted from the top-left of the world. To build the grid, the
+  Earth's surface is first flattened with the Web Mercator projection (which
+  maps the sphere to a square and caps latitude near ±85.05°, which is why
+  polar regions never quite appear), then cut into the $2^z times 2^z$ grid.
+  The payoff of this convention is determinism: given a latitude, a longitude,
+  and a zoom, *anyone can compute which tile contains that point* with a
+  closed-form formula — Section 2.14 implements it in eleven lines of Rust. So
+  the client never asks the server "which tiles do I need?"; it already knows,
+  and requests them by name.
 ]
 
-The pyramid shape is the whole storage story. Four zooms, drawn:
+The pyramid shape that falls out of the zoom rule is the whole storage story,
+so let us look at it before taming it:
 
 #v(0.3em)
 #align(center)[
@@ -285,142 +349,197 @@ The pyramid shape is the whole storage story. Four zooms, drawn:
 ]]
 #v(0.2em)
 
-Our estimate said storing *all* of that naively costs ~29 PB. Two observations
-make it tractable:
+Read the diagram left to right and watch the explosion happen. On the far left,
+zoom 0: the entire planet in one square — one tile, mostly blue. At zoom 1, that
+tile has split into its four children; the shaded squares track one patch of the
+Earth as it subdivides. At zoom 2, sixteen tiles cover the world, and the same
+patch is now a quarter of a quarter. The arrow then jumps the sequence forward
+fifteen more levels to zoom 20, where the count is no longer drawable: about
+1.1 trillion tiles at that level alone, each covering a patch 38 meters wide.
+One tile became four became sixteen became a trillion; that geometric
+progression, multiplied by ~20 KB a tile, is exactly where the ~29 PB estimate
+in Section 2.5 came from.
+
+So how do we afford a 29-petabyte map? We do not — two observations collapse it:
 
 + *Most tiles are uniform.* Roughly 70% of the planet is ocean; enormous areas
-  are desert, ice, or forest. A solid-blue 256×256 square compresses to almost
-  nothing — and, crucially, *it is the same square everywhere*. Storing tiles
-  content-addressed (Section 2.10) means every identical tile in the world is
-  stored *once*; the trillions collapse to the few percent of tiles that
-  actually contain roads and labels.
+  beyond that are desert, ice, or forest. A solid-blue 256×256 square
+  compresses to almost nothing — and, more powerfully, *it is the same square
+  everywhere on Earth*. If we store tiles content-addressed (named by the hash
+  of their contents; Section 2.10), every identical tile in the world is stored
+  exactly *once*. The trillion collapse to the few percent of tiles that
+  actually contain roads and labels, and 29 PB becomes merely large.
 + *Nobody looks at most of the world, most of the time.* Demand is violently
-  skewed toward populated areas and common zooms. That skew is what caching
-  feeds on.
+  skewed toward populated areas and common zooms: midtown Manhattan at zoom 16
+  is served constantly; the mid-Pacific at zoom 20 essentially never. Skew like
+  that is what caching feeds on — a cache holding the popular few percent
+  serves the overwhelming majority of requests.
+
+Which brings us to the machinery that exploits both observations:
 
 #defterm([Content Delivery Network (CDN)])[
   A geographically distributed fleet of *edge caches*: servers in hundreds of
-  cities, each holding copies of popular content close to users. A request is
-  routed to the nearest edge location; on a *cache hit* the content is served
-  locally (single-digit milliseconds, zero load on our infrastructure); on a
-  *miss* the edge fetches from our origin once and caches it for the next
-  requester. CDNs turn a read-heavy, mostly-static workload into someone else's
-  bandwidth.
+  cities, each holding copies of popular content physically close to users. A
+  request is routed to the nearest edge location; on a *cache hit* the content
+  is served locally — single-digit milliseconds, and zero load on our
+  infrastructure; on a *miss* the edge fetches from our origin once and caches
+  the copy for the next requester. A CDN turns a read-heavy, mostly-static
+  workload into someone else's bandwidth, and the tile pyramid is the most
+  read-heavy, most static workload imaginable.
 ]
 
 #defterm([TTL (time to live) / cache hit ratio])[
   A cached entry's _TTL_ is how long an edge may serve it before revalidating
-  with the origin — the dial between freshness and load. The _hit ratio_ is the
-  fraction of requests served from cache. For base map tiles we choose long
-  TTLs (days; roads move slowly) and expect hit ratios above 95%; the *traffic
-  overlay* tiles of Section 2.12 get TTLs of a minute or two, because stale
-  traffic is worthless.
+  with the origin — it is the dial between freshness and load, and you turn it
+  per content type. The _hit ratio_ is the fraction of requests served from
+  cache, and it is the number that decides whether the CDN strategy is working.
+  For base map tiles we choose long TTLs (days; roads move slowly) and expect
+  hit ratios above 95%. The *traffic overlay* tiles of Section 2.12 get TTLs of
+  a minute or two, because stale traffic is worse than no traffic. Same cache,
+  two TTLs — freshness is per-layer, not per-system.
 ]
 
 #pitfall([Serving tiles from your own fleet])[
-  The single most common junior mistake on this problem: drawing a "tile
-  service" that renders or reads tiles on demand per request. At 700k peak QPS
-  that fleet is vast, slow for distant users, and pointless — the content is
-  static and cacheable. The correct shape is: *pre-render tiles offline, push
-  them to object storage, put a CDN in front, and let the origin see a
-  single-digit percentage of traffic.* Rendering is a batch job, not a request
-  path.
+  The single most common junior mistake on this problem is to draw a "tile
+  service" that renders or reads tiles on demand, per request. Run the numbers
+  on that design: at 700k peak QPS with even a cheap 5 ms read, you need
+  thousands of machines whose only job is to re-serve the same static squares
+  forever — slow for distant users, vast, and pointless. The correct shape is:
+  *pre-render tiles offline, push them to object storage, put a CDN in front,
+  and let the origin see a single-digit percentage of traffic.* Rendering is a
+  batch job that runs when the map changes, not a request path that runs when a
+  user pans. Say that sentence in the interview and the map-serving discussion
+  is over.
 ]
 
-One design fork is worth naming here and deciding later (Section 2.17): tiles
+One design fork is worth naming now and deciding later (Section 2.17): tiles
 can be *raster* (pre-rendered images) or *vector* (compact geometry the client
-renders on its GPU). We will serve vector tiles to modern clients — roughly
+renders on its own GPU). We will serve vector tiles to modern clients — roughly
 half the bytes, restyleable without re-rendering, and one tile set serves every
 zoom-adjacent gesture smoothly — while keeping raster fallbacks for old
-clients. Either way, the tiling, addressing, and CDN story is identical.
+clients. Either way, everything you just learned — the pyramid, the addressing,
+the CDN — is identical; only the payload changes.
 
-Place search (FR-2) rides on the same geospatial ideas: a *spatial index* lets
-us find "all places inside this patch of Earth" without scanning 200M records.
-Section 2.7 defines the indexing structure once, because routing needs it too.
+Place search (FR-2) rides on the same geospatial ideas as tiles: a *spatial
+index* lets us find "all places inside this patch of Earth" without scanning
+200M records. We will define that structure once, in Section 2.7's storage
+discussion and Section 2.14's code, because routing needs it too.
 
 == Core Challenge II: Modeling the Road Network
 
-Directions require a mathematical object we can search. That object is a graph,
-built from the road network:
+Directions require a mathematical object we can search. Maps as humans know
+them — pretty pictures of roads — are useless to an algorithm; what we need is
+a structure that encodes *what connects to what, and at what cost*. That
+structure is a graph, and building it from the road network is the second core
+challenge.
 
 #defterm([Graph / weighted directed graph])[
   A _graph_ is a set of *nodes* connected by *edges*. It is _directed_ when
-  edges have a direction (a one-way street is traversable only along its arrow)
-  and _weighted_ when every edge carries a number measuring the *cost* of
-  crossing it. We model intersections as nodes and stretches of road between
-  them as edges, and we call one such directed road piece a *segment*.
+  edges have a direction of travel — a one-way street is traversable only along
+  its arrow — and _weighted_ when every edge carries a number measuring the
+  *cost* of crossing it. We model intersections as nodes and stretches of road
+  between them as edges, and we call one such directed road piece a *segment*.
+  If this feels abstract, hold a city in your head: every intersection is a
+  dot, every block between two intersections is an arrow or two, and the whole
+  city's road network is exactly those dots and arrows.
 ]
 
 #defterm([Segment])[
   The atomic unit of the road network: one directed piece of road between two
-  nodes, carrying metadata — geometry (the polyline of its shape), length, road
-  class (residential, arterial, highway), speed limit, and turn restrictions at
-  its far end. Segments are also the unit of *traffic*: when we say "this road
-  is slow," we mean "this segment's current crossing time is high," and every
-  GPS update we receive is attributed to exactly one segment (Section 2.12).
+  nodes, carrying metadata — its geometry (the polyline of its shape), length,
+  road class (residential, arterial, highway), speed limit, and any turn
+  restrictions at its far end. Segments are also the unit of *traffic*: when we
+  say "this road is slow," we mean "this segment's current crossing time is
+  high," and every GPS update we receive is eventually attributed to exactly
+  one segment (Section 2.12). One concept, two jobs: structure for the router,
+  evidence for the traffic loop.
 ]
 
-The crucial choice is the edge *weight*. Distance is stable but wrong for
-drivers; what users minimize is *time*. So an edge's weight is its *expected
-crossing time*: `length / current expected speed`. "Current expected speed" is
-where live traffic enters — the weight is `length / speed_limit` on an empty
-road, and degrades as Section 2.12's pipeline reports slower observed speeds.
-Routing and traffic are thereby one mechanism: *traffic is just edge weights
-that move.*
+The crucial modeling choice is the edge *weight*, and it is worth thinking
+through rather than accepting. Distance is the obvious candidate — it is
+stable, measurable, and simple. But drivers do not minimize distance; they
+minimize *time*, and the shortest route in miles is often the slowest route in
+minutes. So an edge's weight is its *expected crossing time*: `length / current
+expected speed`. Now watch what this one choice does for the whole chapter. On
+an empty road, "current expected speed" is the speed limit. As Section 2.12's
+pipeline observes real vehicles slowing down, it lowers that speed — and the
+edge weight rises, automatically. Routing and traffic collapse into one
+mechanism: *traffic is just edge weights that move.* FR-4, the traffic-aware
+ETA, needed no new algorithm at all.
 
 #defterm([Adjacency list])[
   The standard memory layout for sparse graphs: for every node, a list of its
-  outgoing edges. Routing graphs are extremely sparse (an intersection has ~3–6
-  outgoing segments), so an adjacency list stores ~300M small records — the
-  ~20 GB from Section 2.5 — instead of the quadratically-sized matrix a dense
-  representation would need. Our routing engine holds adjacency lists *in RAM*;
-  there is no database on the per-request path.
+  outgoing edges. Routing graphs are extremely sparse — an intersection has
+  roughly 3–6 outgoing segments — so an adjacency list stores ~300M small
+  records, the ~20 GB from Section 2.5, where a dense matrix representation
+  would need space quadratic in the node count (petabytes of mostly zeros).
+  Our routing engine holds adjacency lists *in RAM*: there is no database on
+  the per-request path, which is how route latency survives its one-second
+  budget.
 ]
 
-A subtlety interviewers enjoy: a graph edge cannot express "you may enter this
-intersection from Main St but not turn left onto 1st Ave." Turn restrictions
-are handled either by splitting nodes (one node per incoming direction, with
-only legal turns as edges) or by per-edge metadata the search consults. Either
-way, the model — nodes, directed edges, time weights — survives intact.
+One subtlety interviewers enjoy raising: a plain graph edge cannot express "you
+may enter this intersection from Main Street but may *not* turn left onto 1st
+Avenue." Turn restrictions break the fiction that cost lives on edges alone.
+Two standard repairs: split nodes (one node per incoming direction, with edges
+only for legal turns), or attach per-edge metadata that the search consults.
+Either way, the core model — nodes, directed edges, time weights — survives
+intact, and knowing the repair is enough at this level.
 
 == Core Challenge III: Shortest Paths at Planetary Scale
 
+With the road network modeled as a time-weighted graph, computing directions
+becomes a precise mathematical problem:
+
 #defterm([Shortest path problem])[
   Given a weighted graph and two nodes, find the path between them whose total
-  edge weight is minimal. With time-weighted segments, the shortest path is the
-  *fastest route*, and its total weight is the route's ETA. This is the single
-  computation at the heart of FR-3 and FR-4.
+  edge weight is minimal. With our time-weighted segments, the shortest path is
+  the *fastest route*, and its total weight *is* the route's ETA — the answer
+  to FR-3 and FR-4 falls out of the same computation. That tidy reduction is
+  why the modeling work in Section 2.7 mattered: one good model turns two
+  product features into one well-studied algorithmic problem.
 ]
 
-The canonical algorithm, and the one the interviewer expects you to derive:
+Now, which algorithm? The interviewer expects you to know the canonical answer
+*and* to know why you cannot ship it. Let us build the ladder one rung at a
+time — that ordering, from "correct but too slow" to "fast enough to serve,"
+is itself the story of this section.
 
 #defterm([Dijkstra's algorithm])[
-  Explores the graph outward from the source in order of increasing distance
-  from it. Maintain for each node the best known distance (initially ∞, 0 for
-  the source); repeatedly take the not-yet-finalized node with the smallest
-  best-known distance, declare it final, and *relax* its edges — for each
-  outgoing edge, check whether reaching its neighbor through this node beats
-  the neighbor's best-known distance, and if so update it. With a min-priority
-  queue selecting the next node, the running time is $O((V + E) log V)$. It is
-  provably exact for non-negative weights — and crossing times are always
-  non-negative.
+  The classic exact solution, and still the right mental model. The idea:
+  explore the graph outward from the source in order of increasing distance
+  from it, like a stain spreading. Maintain for each node the best known
+  distance (initially ∞ everywhere, 0 at the source); repeatedly take the
+  not-yet-finalized node with the smallest best-known distance, declare it
+  *final* — its distance can never improve, because any other route to it would
+  have to pass through a node with an even larger distance — and *relax* its
+  edges: for each outgoing edge, check whether reaching its neighbor through
+  this node beats the neighbor's best-known distance, and if so, update it.
+  With a min-priority queue picking the next node, the running time is
+  $O((V + E) log V)$, and the answer is provably exact whenever weights are
+  non-negative — which crossing times always are.
 ]
 
 #defterm([Priority queue (min-heap)])[
   A data structure supporting "insert with a priority" and "remove the
-  minimum-priority element," both in $O(log n)$. A binary heap inside an array
-  is the standard implementation. Dijkstra's algorithm spends its life asking
-  "which unfinished node is currently closest?" — exactly this operation.
+  minimum-priority element," both in $O(log n)$; a binary heap inside an array
+  is the standard implementation. Dijkstra's algorithm spends its entire life
+  asking one question — "which unfinished node is currently closest to the
+  source?" — and a priority queue is precisely that question, as a data
+  structure.
 ]
 
-Dijkstra is correct — and unusable here. A cross-country query on ~100M nodes
-takes seconds of CPU; Section 2.5 showed that times 20k QPS is ~60,000 cores.
-Three refinements, each a layer of the same idea — *search less of the graph*:
+Here is the uncomfortable arithmetic that frames the rest of the section.
+Dijkstra is correct — and unusable at our scale. A cross-country query over
+~100M nodes takes seconds of CPU; Section 2.5 showed that seconds × 20k QPS is
+~60,000 cores of pure search. We cannot buy our way out; we must *search less
+of the graph*. Each of the next three refinements is a different way of doing
+exactly that.
 
 *Refinement 1 — bidirectional Dijkstra.* Run two searches simultaneously: one
 forward from the origin, one *backward* from the destination over reversed
 edges. Stop when the frontiers meet; the route is the two half-paths joined.
-Why it helps is geometric:
+Why does that help? The picture makes it obvious:
 
 #v(0.3em)
 #align(center)[
@@ -447,78 +566,96 @@ Why it helps is geometric:
 ]]
 #v(0.2em)
 
-A forward search from A must explore roughly every node within distance _d_ of
-A — a ball whose node count grows like the *area* $pi d^2$. Two half-searches
-each explore a ball of radius $d \/ 2$; together that is
-$2 dot pi (d \/ 2)^2 = pi d^2 \/ 2$ — about *half* the work in a uniform graph,
-and better in road networks, where the frontiers approach each other along
-highways. Same exact answer, half the CPU, and trivially parallelizable across
-two threads.
+The left panel shows the unidirectional search. Dijkstra knows nothing about
+where B is, so it explores *everything* within reach of A: a disk whose radius
+grows until it touches B. If A and B are distance _d_ apart, that disk has
+radius _d_ and — in a roughly planar road network, where node count grows with
+area — contains on the order of $pi d^2$ nodes. The right panel shows the
+bidirectional search: a blue disk spreading from A and a teal one spreading
+backward from B, and the algorithm stops the moment the two frontiers touch.
+Each disk has radius only $d \/ 2$, so together they explore about
+$2 dot pi (d \/ 2)^2 = pi d^2 \/ 2$ — *half* the nodes. The saving comes from
+the quadratic: halving the radius quarters each disk, and two quarter-disks
+beat one whole disk. Same provably-exact answer, half the CPU, and the two
+searches are trivially run on two threads. A real improvement — and nowhere
+near enough.
 
-*Refinement 2 — A\* search.* Dijkstra explores equally in *all* directions —
-including straight away from the destination, which is obviously wasted. A\*
-steers the search by reordering the priority queue.
+*Refinement 2 — A\* search.* Look at the left disk again and something should
+offend you: Dijkstra explores equally in *all* directions, including straight
+away from the destination. Every node it finalizes on the far side of A from B
+is provably wasted work. A\* fixes this by reordering the priority queue so the
+frontier grows *toward* B instead of uniformly.
 
 #defterm([Heuristic / admissible heuristic])[
-  In A\*, each node's queue priority is `known distance from source + h(node)`,
-  where the _heuristic_ `h` estimates the remaining distance to the
+  In A\*, each node's queue priority becomes `known distance from source +
+  h(node)`, where the _heuristic_ `h` estimates the *remaining* distance to the
   destination. The heuristic is _admissible_ if it never *overestimates* the
-  true remaining cost. Admissibility preserves Dijkstra's exactness guarantee
-  while pulling the search frontier toward the goal — nodes in the right
-  direction get popped first.
+  true remaining cost — and admissibility is the whole ballgame: with it, A\*
+  keeps Dijkstra's exactness guarantee while pulling the search frontier toward
+  the goal, because nodes in promising directions get smaller priorities and
+  are popped first. Overestimate even once and you can finalize a node through
+  the wrong path; the guarantee dies quietly.
 ]
 
-For a road network, the admissible heuristic is the *straight-line distance to
-the destination divided by the fastest speed anywhere in the network*: no legal
-route can beat the crow flying at top speed, so this `h` never overestimates.
-Computing it needs distances between points on a sphere:
+For a road network, nature hands us a perfect admissible heuristic: the
+*straight-line distance to the destination, divided by the fastest speed
+anywhere in the network*. No legal route can beat the crow flying at top
+speed, so this `h` never overestimates — it is admissible by construction.
+Computing it requires distances between points on a sphere, which needs one
+more definition:
 
 #defterm([Haversine distance])[
   The great-circle distance between two latitude/longitude points on a sphere —
-  the length of the shortest path over the Earth's surface ("as the crow
-  flies"). A closed-form trigonometric formula computes it in microseconds;
-  Section 2.14 implements it. Haversine is our heuristic's yardstick and our
-  fallback whenever "how far apart are these coordinates?" appears.
+  the length of the shortest path over the Earth's surface, "as the crow
+  flies." A closed-form trigonometric formula computes it in microseconds;
+  Section 2.14 implements it. Haversine is our heuristic's yardstick and, more
+  generally, our fallback whenever the question "how far apart are these two
+  coordinates?" appears anywhere in the system.
 ]
 
 *Refinement 3 — hierarchy: mega-segments, then contraction hierarchies.* Even
-A\* explores every side street near the origin and destination. But observe how
-*you* drive cross-country: local streets for a minute, then a highway for three
-hundred miles, then local streets again. The middle of a long route almost
-never touches small roads. Turn that observation into a mechanism: precompute
-and *aggregate*.
+A\* has a blind spot: it still explores every side street near the origin and
+the destination, because near the endpoints the heuristic cannot yet
+distinguish promising from unpromising detours. Now think about how *you*
+actually drive cross-country: local streets for a minute, then a highway for
+three hundred miles, then local streets again. The middle of a long route
+almost never touches small roads — and that human observation can be turned
+into a mechanism: precompute the hierarchy and let queries climb it.
 
 #defterm([Mega-segment])[
   A precomputed synthetic edge that summarizes a chain of ordinary segments —
   for example, one edge meaning "highway, exit 12 to exit 47, 52 km, ~31
   minutes at current speeds." A long-distance search can then hop between
   on-ramps and off-ramps on mega-segments instead of expanding thousands of
-  small segments. The source talk builds its long-range routing this way:
-  segments roll up into mega-segments, which roll up further, so a query
-  quickly climbs from street level to highway level, crosses the country on a
-  handful of edges, and descends again. Mega-segment weights are sums of member
-  segment weights — so when traffic updates a segment (Section 2.12), the
-  change *bubbles up* to every mega-segment containing it.
+  small ones. The source talk builds its long-range routing this way: segments
+  roll up into mega-segments, which roll up further, so a query quickly climbs
+  from street level to highway level, crosses the country on a handful of
+  edges, and descends again. And because a mega-segment's weight is the *sum*
+  of its members' weights, when traffic updates a segment (Section 2.12), the
+  change simply *bubbles up* to every mega-segment containing it — the
+  hierarchy stays live without being rebuilt.
 ]
 
 The literature's formal, optimal version of the same idea:
 
 #defterm([Contraction hierarchy (CH)])[
-  A preprocessed form of the road graph. Offline, order all nodes by importance
-  (highway junctions outrank cul-de-sacs) and *contract* them in that order:
-  removing a low-importance node, and — whenever the shortest path between two
-  of its neighbors ran through it — inserting a *shortcut edge* with the summed
-  weight, so all shortest-path distances are preserved. At query time, run
-  bidirectional Dijkstra with one rule: only follow edges that go *up* in
-  importance. The two upward searches meet at the most important node on the
-  route. Preprocessing takes hours and adds ~30–100% more edges; queries drop
-  from seconds to *microseconds-to-milliseconds* — the roughly 1000× speedup
-  Section 2.5's arithmetic demands. Production engines (OSRM, Valhalla, and
-  the systems the source talk gestures at with mega-segments) all run variants
-  of this playbook.
+  A preprocessed form of the road graph, built offline in two steps. First,
+  order all nodes by importance — highway junctions outrank cul-de-sacs.
+  Second, *contract* the nodes in that order: remove a low-importance node,
+  and whenever the shortest path between two of its neighbors ran through it,
+  insert a *shortcut edge* with the summed weight, so every shortest-path
+  distance in the graph is preserved exactly. At query time, run bidirectional
+  Dijkstra with one extra rule: only follow edges that go *up* in importance.
+  The two upward searches meet at the most important node on the route — and
+  because unimportant nodes were contracted away, the search spaces are tiny.
+  Preprocessing takes hours and adds ~30–100% more edges; in exchange, queries
+  drop from seconds to *microseconds-to-milliseconds* — the roughly 1000×
+  speedup that Section 2.5's arithmetic demands. Production engines (OSRM,
+  Valhalla, and the systems the source talk gestures at with mega-segments)
+  all run variants of this playbook.
 ]
 
-The full ladder, with the numbers that justify it:
+The full ladder, with the numbers that justify each rung:
 
 #tbl(
   (auto, auto, auto, 1fr),
@@ -532,36 +669,45 @@ The full ladder, with the numbers that justify it:
 )
 
 #insight([Precomputation is the theme of the whole chapter])[
-  Tiles are pre-rendered so reads are cache hits (Section 2.6); the graph is
-  pre-contracted so queries touch only highways-in-the-middle (this section);
-  traffic speeds are pre-aggregated per segment so ETAs are table lookups
+  Step back and notice what the last three sections have in common. Tiles are
+  pre-rendered so reads become cache hits (Section 2.6). The graph is
+  pre-contracted so queries touch only highways-in-the-middle (this section).
+  Traffic speeds are pre-aggregated per segment so ETAs become table lookups
   (Section 2.12). A maps system is a machine for moving work *off* the request
-  path and into batch and stream pipelines. When an interviewer asks "how does
-  it answer so fast?", the honest one-word answer is: *earlier*.
+  path and into batch and stream pipelines that ran earlier. So when an
+  interviewer asks "how does it answer so fast?", the honest one-word answer
+  is: *earlier*.
 ]
 
 == API & Protocol Design
 
-Chapter 1 split its API into a control plane and a data plane; the same split
-applies, with a twist: our heaviest "API" is not an API at all.
+Chapter 1 split its API into a control plane and a data plane, and the same
+split applies here — with one twist worth savoring: our heaviest "API" is
+barely an API at all.
 
-*Tiles are plain GETs — and mostly not ours.* The client computes the
-$(z, x, y)$ address of every tile in view (Section 2.6) and issues ordinary
+*Tiles are plain GETs — and mostly not ours.* Because the slippy-map scheme is
+deterministic, the client computes the $(z, x, y)$ address of every tile in
+view by itself (Section 2.14 has the eleven lines) and issues ordinary
 `GET /v1/tiles/{z}/{x}/{y}` requests against a tile hostname. Nearly all of
-these terminate at a CDN edge and never reach us. This is why the tile endpoint
-has no interesting request parameters: all the intelligence is in the
-*addressing scheme*.
+those requests terminate at a CDN edge and never reach our infrastructure. Sit
+with that for a second, because it inverts the usual API-design story: the tile
+endpoint has *no interesting request parameters*, no session, no state — all
+the intelligence lives in the addressing scheme, which the client and the cache
+both understand. The best-designed endpoint in this system is the one we barely
+operate.
 
 #defterm([Polyline encoding])[
-  A compact ASCII encoding of a sequence of coordinates — Google's variant
-  encodes latitude/longitude deltas as variable-length base-64-ish text, so a
-  500-point route is a few hundred bytes instead of a JSON array of floats.
-  Routes are transmitted as encoded polylines and decoded client-side; the
-  format exists because a route crosses a route-length's worth of geography but
-  must fit in one small response.
+  A compact ASCII encoding of a sequence of coordinates. Google's variant
+  encodes latitude/longitude *deltas* as variable-length, base-64-ish text, so
+  a 500-point route becomes a few hundred bytes instead of a JSON array of
+  floats ten times larger. Routes are transmitted as encoded polylines and
+  decoded client-side. The format exists because a route is geometrically huge
+  — it crosses a route-length's worth of geography — but must fit inside one
+  small, cacheable response.
 ]
 
-The remaining request/response endpoints (REST, as defined in Chapter 1):
+The remaining request/response endpoints are ordinary REST (as defined in
+Chapter 1):
 
 #tbl(
   (auto, auto, 1fr),
@@ -575,7 +721,8 @@ The remaining request/response endpoints (REST, as defined in Chapter 1):
   ),
 )
 
-A route request and its response:
+A route request and its response, so you can see exactly what the routing
+engine's output becomes on the wire:
 
 ```json
 POST /v1/routes
@@ -603,9 +750,19 @@ POST /v1/routes
 }
 ```
 
-Navigation (FR-5) is a session, not a request: the phone streams its position
-up and the server streams guidance down. That is a bidirectional, long-lived,
-low-latency channel — the WebSocket data plane from Chapter 1, reused verbatim.
+Two fields in that response deserve a pause. `eta_seconds` versus
+`eta_in_traffic_seconds` is Section 2.7's design made visible: the first is the
+route at free-flow weights, the second at *current* weights, and showing both
+is what lets the UI say "10 minutes slower than usual." And each step carries
+`segment_ids` — the route is not just a picture, it is a list of the exact
+road segments the user will traverse, which is precisely what the navigation
+session needs to track progress and what the traffic pipeline needs to match
+this user's GPS updates back to the roads they are actually on.
+
+Navigation (FR-5) is a *session*, not a request: the phone streams its position
+up, and the server streams guidance down, for as long as the trip lasts. That
+is a bidirectional, long-lived, low-latency channel — in other words, exactly
+the WebSocket data plane Chapter 1 built, reused verbatim:
 
 #tbl(
   (auto, auto, 1fr),
@@ -615,26 +772,35 @@ low-latency channel — the WebSocket data plane from Chapter 1, reused verbatim
     [`location_update`], [client → server], [`{lat, lng, speed_mps, heading_deg, t}` — one GPS fix, every ~5 s; drives guidance *and* the traffic pipeline],
     [`instruction`], [server → client], [`{text, voice, distance_to_maneuver_m}` — the next turn, delivered early enough to speak],
     [`eta_update`], [server → client], [`{eta_seconds, remaining_m}` — refreshed as segment weights move],
-    [`reroute`], [server → client], [`{reason, new_route}` — deviation or a newly faster alternative],
+    [`reroute`], [server → client], [`{reason, new_route}` — deviation, or a newly faster alternative],
     [`nav_end`], [either], [Arrived, cancelled, or the connection dropped],
   ),
 )
 
-Two protocol notes. First, `location_update` is *one stream feeding two
-masters*: live guidance for this user, and (anonymized, aggregated) the traffic
-pipeline for everyone else — Section 2.12 draws that fork. Second, navigation
-is the one place we push *down* to a moving phone, which raises the question
-"which gateway holds this user's connection?" — answered by the connection
-manager in Section 2.13.
+Two protocol notes before we move on. First, look at `location_update`
+carefully: it is *one stream feeding two masters*. The navigation service uses
+it to guide this user, right now; the traffic pipeline uses it — anonymized and
+aggregated — to update everyone's edge weights. Section 2.12 draws that fork as
+a picture. Second, navigation is the one place in the whole system where *we*
+push *down* to a moving phone, and that raises a plumbing question the diagram
+in Section 2.11 must answer: with millions of WebSocket gateways, which one
+holds this user's connection? The connection manager, introduced there, exists
+to answer exactly that.
 
 == Data Model & Storage
 
+Six entity families, six different access patterns — which is this chapter's
+excuse to define a term you should reach for whenever one database is asked to
+be four things:
+
 #defterm([Polyglot persistence])[
   Using different storage engines for different access patterns within one
-  system, instead of forcing every entity into one database. The cost is
-  operational complexity; the benefit is that each workload gets the structure
-  it actually needs. A maps system is the canonical case — our six entities
-  below want six different shapes.
+  system, instead of forcing every entity into a single database. The cost is
+  real — operational complexity, more moving parts, more consistency questions
+  — but the benefit is that each workload gets the structure it actually needs.
+  A maps system is the canonical case for it, as the table below shows: our six
+  entities want six different shapes, and pretending otherwise would punish
+  every one of them.
 ]
 
 #tbl(
@@ -651,17 +817,22 @@ manager in Section 2.13.
   ),
 )
 
-The ideas interviewers reward here: tiles are *content-addressed* (the 29 PB
-problem of Section 2.5 collapses because duplicate oceans are stored once); the
-routing graph lives *in memory*, with stores acting only as its source of truth
-during reloads; and the traffic cache's TTL *is* the freshness guarantee —
-a segment whose entry has expired simply stops claiming live data.
+Three ideas in this table are the ones interviewers reward, so let us pull them
+out of the rows. First, tiles are *content-addressed*: Section 2.5's 29 PB
+nightmare collapses because duplicate oceans are stored once, under one hash.
+Second, the routing graph lives *in memory* — the stores are only its source of
+truth during reloads, never on the request path; that is how route latency
+survives its budget. Third, and most elegant: the traffic cache's TTL *is* the
+freshness guarantee. A segment whose entry has expired simply stops claiming
+live data, and the system degrades to historical patterns without anyone
+handling an error. Absence as a signal is a pattern worth stealing.
 
 == High-Level Architecture
 
-Section 2.4 promised separate planes; here they are. The *read plane* (tiles,
-search, routes) is stateless and cache-fronted. The *streaming plane* (GPS in,
-traffic out) is a pipeline. Navigation sits astride both.
+Section 2.4 promised that this system has separate planes with separate NFRs;
+here they are, in one picture. The *read plane* (tiles, search, routes) is
+stateless and cache-fronted. The *streaming plane* (GPS in, traffic out) is a
+pipeline. Navigation sits astride both. Then we will walk the picture slowly.
 
 #v(0.3em)
 #align(center)[
@@ -713,7 +884,63 @@ traffic out) is a pipeline. Navigation sits astride both.
 ]]
 #v(0.2em)
 
-Component responsibilities, and the reason each exists:
+This diagram has a lot of moving parts, so let us walk it in the order data
+actually flows, and make sure every arrow earns its place.
+
+*The read plane, top half.* Begin at the top left. When a client pans the map,
+its tile requests drop almost immediately into the *CDN edge* box directly
+below — the vertical arrow — and, for 95%+ of them, the journey ends right
+there. Only on a cache miss does the long dashed arrow down the left margin
+carry the request to our *tile object store*, the "origin on miss." The base
+map, remember, changes weekly at worst, so even a stale edge copy is safe to
+serve while revalidating.
+
+Everything else the client asks for — search, routes, navigation — flows right
+through the two gateway boxes. Plain REST calls (search, routes) go through the
+*API gateway*, which does the ordinary edge work: authentication, rate
+limiting, routing. Long-lived navigation connections go through the *WebSocket
+gateway fleet*, Chapter 1's stateless connection-holders reused without
+changes. From the API gateway, three short arrows fan out to the read-plane
+services: the *search service* answers place queries over its text × spatial
+index; the *routing service* answers directions on its in-memory CH graph; and
+the *navigation service* — highlighted, because it is the session-ful one —
+runs the per-user guidance state machine of Section 2.13.
+
+*The streaming plane, middle row.* Now watch a GPS fix take the other road.
+While navigating, the phone sends a `location_update` every five seconds; the
+teal arrow carries it down from the WS gateway to *location ingestion*, whose
+job is to absorb 3M updates per second, validate them, strip identity, and
+absorb bursts so processing never sees them. From there the fix enters the
+*event stream* — a durable, partitioned log (defined properly in Section 2.12)
+— and then the *stream processors*, which do the two hard jobs: map-matching
+the noisy fix onto a real segment, and folding its speed into that segment's
+running average.
+
+*Where the two planes meet.* The long teal arrow from the stream processors
+down to the *traffic cache* is the handshake between the planes: per-segment
+speeds land in a small, hot, TTL-governed cache. And then the arrow labeled
+"weights" — dashed teal, from the traffic cache up to the routing service — is
+the single most important arrow in the whole design: it is how *reality changes
+the answers*. Every few minutes, the routing engine's edge weights are
+re-read from the cache, so the very next route request routes around a jam that
+formed ninety seconds ago. Meanwhile a second dashed arrow, "graph reload,"
+runs from the segment store up to the routing service: that is the slow path
+by which new roads and edited geometry enter the in-memory graph on a
+periodic rebuild-and-swap cycle.
+
+*The amber plumbing, top right.* One small box is easy to overlook: the
+*connection manager*. When the navigation service decides a user needs a
+`reroute` push, it knows *what* to send but not *where the user's socket
+lives* among thousands of gateways. The connection manager is the registry
+that answers — the amber "lookup" arrow — and Section 2.13 shows how it is
+kept honest.
+
+Finally, the bottom row of stores should look familiar from Section 2.10 —
+they are drawn in the same left-to-right order as the workloads above them:
+tiles at the far left behind the CDN, segments under ingestion, the traffic
+cache under the stream processors, and the *historical speeds* warehouse at
+the far right, quietly batch-computed each night from the day's GPS archive
+and standing ready as the fallback whenever live data runs dry.
 
 #tbl(
   (auto, 1fr, 1fr),
@@ -724,10 +951,10 @@ Component responsibilities, and the reason each exists:
     [Search service], [Text × spatial place lookup], [Read-heavy over a slowly-changing index; replicas scale it],
     [Routing service], [Compute routes + ETAs on the CH graph], [Holds the graph *in RAM*; scales by region shards and replicas (Section 2.15)],
     [WS gateway fleet], [Hold millions of navigation connections], [Stateless connection holders, exactly as in Chapter 1],
-    [Navigation service], [Per-session guidance: progress, instructions, ETA refresh, reroutes], [Stateful per session but sessions are small and independent],
+    [Navigation service], [Per-session guidance: progress, instructions, ETA refresh, reroutes], [Stateful per session — but sessions are small and independent],
     [Connection manager], [Registry: user → which gateway], [So the navigation service can push `reroute` to the right socket (Section 2.13)],
     [Location ingestion], [Absorb 3M updates/s, validate, anonymize], [A buffer that decouples phone bursts from processing (Section 2.12)],
-    [Event stream], [Durable, replayable pipe of GPS updates], [Chapter 2 defines it below; lets many consumers read the same firehose],
+    [Event stream], [Durable, replayable pipe of GPS updates], [Defined in Section 2.12; lets many consumers read the same firehose],
     [Stream processors], [Map-match pings to segments; average speeds; write traffic cache; bubble weights up mega-segments], [The batch-quality work of traffic, done continuously],
   ),
 )
@@ -735,45 +962,54 @@ Component responsibilities, and the reason each exists:
 == Deep Dive: The Live Traffic Loop
 
 This is the subsystem that turns "a map" into "*current* conditions," and it is
-the heart of the source talk. Follow one GPS update until it changes someone's
-ETA.
+the heart of the source talk. It is also a beautiful example of a feedback loop
+in systems form: the product's own users generate the data that improves the
+product's answers for everyone. Let us define the four moving parts first, then
+follow one GPS update until it changes a stranger's ETA.
 
 #defterm([Event streaming platform (Kafka-class)])[
-  A distributed, durable, append-only log organized into *topics*; producers
-  append events, and any number of independent *consumers* read them at their
-  own pace. Topics are *partitioned* (we partition by geographic key, e.g.
-  geohash prefix) so hundreds of consumer instances process the stream in
-  parallel, each owning a disjoint slice of the world. It absorbs our 3M
-  updates/second, decouples ingestion from processing, and — because it is
-  replayable — lets us rebuild derived state after failures.
+  A distributed, durable, append-only log organized into *topics*. Producers
+  append events; any number of independent *consumers* read them at their own
+  pace, and the log remembers, so a slow or crashed consumer resumes where it
+  left off. Topics are *partitioned* — we partition by geographic key, a
+  geohash prefix — so hundreds of consumer instances process the stream in
+  parallel, each owning a disjoint slice of the world. For us it absorbs the
+  3M updates/second, decouples ingestion from processing, and — because it is
+  replayable — lets us rebuild derived state after failures. Chapter 4 studies
+  this kind of platform as a design problem in its own right.
 ]
 
 #defterm([Stream processing])[
-  Computing over data *as it arrives*, event by event or in small windows,
-  rather than in scheduled batch runs over stored data. Here: every GPS update
-  is map-matched and folded into a per-segment running average within seconds
-  of leaving the phone.
+  Computing over data *as it arrives* — event by event, or in small windows —
+  rather than in scheduled batch runs over stored data. The distinction matters
+  because freshness demands it: a nightly batch over today's GPS data would give
+  you yesterday's traffic. Here, every GPS update is map-matched and folded
+  into a per-segment running average within seconds of leaving the phone.
 ]
 
 #defterm([Map-matching])[
   Snapping a noisy GPS fix to the road segment the vehicle is most likely
-  actually on. Raw GPS is wrong by 5–50 meters — enough to place a car on the
-  wrong street or inside a building. The production-standard approach models
-  the trace as a *hidden Markov model* (hidden states = candidate segments near
-  each fix; emission scores = closeness of fix to segment; transition scores =
-  plausibility of the implied movement) and solves it with the Viterbi
-  algorithm. Map-matching is why the traffic pipeline's first stage is a
-  *processor*, not a database write.
+  *actually* on. Raw GPS is wrong by 5–50 meters — enough to place a car on the
+  wrong street, on a parallel frontage road, or inside a building. The
+  production-standard approach models the trace as a *hidden Markov model*:
+  hidden states are the candidate segments near each fix, emission scores
+  measure how close the fix is to each candidate, and transition scores measure
+  how plausible the implied movement between consecutive candidates is; the
+  Viterbi algorithm then finds the most likely segment sequence. Map-matching
+  is why the traffic pipeline's first stage is a *processor*, not a database
+  write — the raw fix is evidence, not fact.
 ]
 
 #defterm([Sliding window])[
   A moving time interval over a stream — "the last 15 minutes," recomputed as
   time advances. A per-segment sliding-window average of observed speeds is our
-  definition of "current speed": old enough data falls out of the window and
-  stops influencing the present. Section 2.14 implements the window.
+  operational definition of "current speed": old enough data falls out of the
+  window and stops influencing the present, so the average tracks reality with
+  a bounded lag and a bounded memory. Section 2.14 implements the window in
+  about twenty lines.
 ]
 
-The loop, end to end:
+Now the loop itself, end to end:
 
 #v(0.3em)
 #align(center)[
@@ -797,81 +1033,113 @@ The loop, end to end:
 ]]
 #v(0.2em)
 
-Three design details carry the interview:
+Trace one fix through the picture. Top row, left to right: your phone, mid-
+navigation, emits a GPS fix every five seconds; ingestion absorbs it (with 3M
+of its siblings every second) and drops it onto the geo-partitioned topic; the
+map-matcher consumes it and decides which segment you are really on; the
+aggregator folds your speed into that segment's sliding window. Now the loop
+turns downward: the fresh per-segment average lands in the *traffic cache*,
+TTL ticking. From there the picture forks left along the bottom row, and the
+fork is the two places "current speed" becomes user-visible. One arrow feeds
+the *routing graphs*: edge weights update, mega-segment weights bubble up as
+their members change, and every *subsequent* route request quietly routes
+around the jam — no code path changed, because traffic was always just
+weights. The other arrow feeds the *traffic tiles*: segment speeds become
+green/yellow/red classes rendered into the overlay layer with its one-minute
+TTL, so the next pan shows the jam in red. Reality to pixels to routing
+decisions, in a few minutes, forever.
+
+Three design details carry the interview discussion of this loop:
 
 + *Speed, not position, is the aggregate.* Per segment and window, we average
-  the speeds of map-matched vehicles. One slow vehicle is noise (a delivery
-  van at the curb); the *average* over dozens of vehicles in 15 minutes is
-  signal. This is also why privacy and accuracy align: nobody's individual
-  trace is stored in the traffic cache — only segment statistics.
+  the *speeds* of map-matched vehicles. One slow vehicle is noise — a delivery
+  van at the curb with its hazards on; the average over dozens of vehicles in
+  fifteen minutes is signal. And notice the happy alignment: because only
+  segment statistics survive, nobody's individual trace is stored in the
+  traffic cache at all. Privacy and accuracy, for once, pull in the same
+  direction.
 + *Sparse segments fall back to history.* At 3 a.m. on a rural road, the window
-  holds too few samples. Below a minimum count we blend toward the *historical*
-  speed for that segment, day-of-week, and time-of-day — Tuesday-8 a.m. traffic
-  is remarkably similar to last Tuesday-8 a.m. Live data where it exists,
-  patterns where it does not, speed limits as the floor of last resort.
+  holds too few samples to trust. Below a minimum count, we blend toward the
+  *historical* speed for that segment, day-of-week, and time-of-day — and
+  traffic is blessedly periodic, so Tuesday-8 a.m. looks remarkably like last
+  Tuesday-8 a.m. The rule of thumb: live data where it exists, patterns where
+  it does not, the speed limit as the floor of last resort.
 + *Third-party feeds are scored, not trusted.* We also ingest incident and flow
-  feeds from external providers. The talk's discipline: validate each feed
-  against our own observed reality — if a provider claims congestion on a
-  corridor where our measured speeds never dropped, that claim is wrong, and a
-  provider that is wrong often gets *down-weighted or ignored* at the
-  organization level. Every external signal is guilty until statistically
-  innocent.
+  feeds from external providers — and the talk is explicit about the
+  discipline: validate each feed against our own observed reality. If a
+  provider claims congestion on a corridor where our measured speeds never
+  dropped, the claim is wrong; a provider wrong too often is down-weighted or
+  ignored at the organization level. Every external signal is guilty until
+  statistically innocent.
 
-The same machinery paints the traffic overlay (FR-6): segment speeds become
-green/yellow/red classes, rendered into a *separate tile layer* with a TTL of a
-minute or two — short-lived tiles on top of the long-lived base map, each layer
-cached at its own freshness.
+The same machinery, one more time, paints the traffic overlay of FR-6 —
+segment speeds become color classes, rendered into a *separate tile layer* with
+a TTL of a minute or two: short-lived tiles stacked on the long-lived base
+map, each layer cached at its own freshness, exactly as Section 2.6's TTL
+discussion promised.
 
 == Deep Dive: The Turn-by-Turn Navigation Session
 
 A navigation session is a small state machine per user, held in the navigation
 service: `ON_ROUTE → OFF_ROUTE_SUSPECTED → REROUTING → ON_ROUTE → ARRIVED`.
-Each `location_update` advances it:
+Each incoming `location_update` advances it through four steps, and each step
+has a design decision embedded in it:
 
 + *Project.* Map-match the fix onto the planned route's polyline: how far along
-  the route is the user, and how far *off* it?
-+ *Guide.* From progress along the route, emit the next `instruction` early
-  enough to be spoken ("in 300 meters, turn right").
+  the route is the user, and how far *off* it? Projection turns raw geography
+  into progress.
++ *Guide.* From progress, emit the next `instruction` early enough to be
+  spoken — "in 300 meters, turn right" must arrive with time for the voice to
+  say it and the driver to change lanes. Guidance is scheduled by distance to
+  the maneuver, not by wall-clock.
 + *Refresh.* Recompute the ETA over the remaining segments using *current*
-  weights from the traffic cache; push `eta_update` when it moves by more than
-  a small threshold (users notice a jumping ETA; hysteresis is a feature).
+  weights from the traffic cache; push an `eta_update` only when the value
+  moves by more than a small threshold. Users notice a jumping ETA and read it
+  as the product being confused; hysteresis here is a *feature*, not sloppiness.
 + *Reroute.* If the fix sits beyond a distance threshold from the polyline
-  *and* heading disagrees with the route, *sustained* for a few consecutive
-  updates (one bad fix must not trigger a reroute — GPS noise is constant),
-  recompute from the current position and push `reroute` with the new route.
-  Section 2.14 implements this decision.
+  *and* heading disagrees with the route — *sustained* across a few consecutive
+  updates, because one bad fix must never trigger a reroute (GPS noise is
+  constant) — recompute from the current position and push `reroute` with the
+  new route. Section 2.14 implements this exact decision as the
+  `RerouteFilter`.
 
-The push path needs one piece of plumbing: the navigation service knows *what*
-to send but not *where the user's socket lives*. The *connection manager* — a
-replicated key-value registry mapping `user_id → gateway_id` — answers that:
-gateways register each connection on connect and remove it on drop; the
-navigation service looks the user up and hands the message to that gateway. If
-the registry entry is stale (a gateway died), the client's reconnect registers
-a fresh one within seconds, and at worst one push is retried. This is Chapter
-1's stateless-gateway story, completed with its directory.
+The push path needs one piece of plumbing we deferred: the navigation service
+knows *what* to send but not *where the user's socket lives*. The *connection
+manager* — a replicated key-value registry mapping `user_id → gateway_id` —
+answers that question: gateways register each connection on connect and remove
+it on drop; the navigation service looks the user up and hands the message to
+the right gateway. If the registry entry is stale because a gateway died, the
+client's reconnect registers a fresh one within seconds, and at worst one push
+is retried. This is Chapter 1's stateless-gateway story, completed with its
+directory.
 
 #pitfall([Rerouting on a single GPS fix])[
   GPS in a downtown canyon can teleport a user two blocks sideways for one
-  update. A reroute fired on that ghost fix is a terrible user experience — and
-  it also *pollutes the traffic pipeline* with a phantom slow-down on a road
-  the user never touched. Both loops therefore consume *map-matched, sustained*
-  signals, never raw single fixes. The same discipline, twice.
+  update and then snap back. A reroute fired on that ghost fix is a terrible
+  user experience — the voice confidently announces a new route to a driver who
+  never left the old one — and it has a subtler cost: it *pollutes the traffic
+  pipeline* with a phantom slow-down on a road the user never touched. Both
+  loops therefore consume map-matched, sustained signals, never raw single
+  fixes. The same discipline, applied twice, in two subsystems that never meet.
 ]
 
 #tip([Navigation availability is a degradation story, not an uptime story])[
-  Four nines on the navigation path does not mean "the server never dies"; it
-  means *the phone copes when it does*. The client caches its route, its
-  upcoming tiles, and its step list; if the session drops, guidance continues
-  locally from the last known state while a new session is established. Saying
-  "the client is the final fallback layer of the server" is exactly the kind of
-  answer the 99.99% requirement is fishing for.
+  Four nines on the navigation path does not mean "the server never dies" — at
+  our scale the server dies daily. It means *the phone copes when it does*. The
+  client caches its route, its upcoming tiles, and its step list; if the
+  session drops, guidance continues locally from the last known state while a
+  new session is established in the background. Saying "the client is the
+  final fallback layer of the server" out loud is exactly the kind of answer
+  the 99.99% requirement is fishing for.
 ]
 
 == Deep Dive: Rust Reference Implementations
 
 Four pieces of this chapter are small enough — and interview-critical enough —
 to show in full: tile addressing, the routing core, the traffic window, and the
-reroute decision.
+reroute decision. As you read them, keep mapping each one back to the section
+it implements; that mapping is what turns "I read about it" into "I can build
+it."
 
 === Tile addressing: lat/lng → tile → quadkey
 
@@ -931,14 +1199,20 @@ mod tests {
 }
 ```
 
-The quadkey is the bridge to place search: index every place under the quadkey
-of its location, and "places near me" becomes "places whose key shares my
-tile's prefix," widened one ring of neighbors at a time.
+Pause on the quadkey, because it is the bridge from map-serving to place
+search. Since a quadkey *is* a quadtree path, all tiles inside a region share
+the region's key as a prefix — so if you index every place under the quadkey of
+its location, then "places near me" becomes "places whose key shares my tile's
+prefix," widened one ring of neighbors at a time. A two-dimensional spatial
+query collapses into a string-prefix range scan, and any sorted key-value store
+can serve it. Chapter 12's geohash index is the same trick with a different
+alphabet.
 
 === The routing core: haversine, Dijkstra, A\*
 
 Section 2.8's algorithm ladder, executable. Weights are integer *milliseconds*
-of expected crossing time — exact, and exactly what the traffic loop updates.
+of expected crossing time — exact arithmetic, and exactly what the traffic loop
+updates:
 
 ```rust
 use std::cmp::Reverse;
@@ -1036,8 +1310,12 @@ pub fn astar(g: &RoadGraph, source: NodeId, target: NodeId) -> Option<(u64, Vec<
 }
 ```
 
-And the test that demonstrates the chapter's slogan — *traffic is just edge
-weights that move*:
+Read the two functions side by side and you will see that A\* *is* Dijkstra —
+same loop, same relaxation, same predecessor walk — with a single difference:
+what the heap orders by. That is the honest way to present A\* in an interview:
+not a new algorithm, but Dijkstra with its priorities aimed at the goal. And
+here is the test that demonstrates the chapter's slogan — *traffic is just
+edge weights that move*:
 
 ```rust
 #[cfg(test)]
@@ -1089,6 +1367,11 @@ mod tests {
 }
 ```
 
+The `traffic_reroutes` test is the one to internalize. We mutate two weights —
+a jam forms on the 3→4 segment — and the *same unmodified Dijkstra* now returns
+the long way around. No "traffic mode," no special case: the router does not
+know traffic exists. That is what Section 2.7 bought by making weight mean
+expected crossing time.
 
 === The traffic window: from GPS fixes to edge weights
 
@@ -1182,12 +1465,20 @@ mod tests {
 }
 ```
 
+Notice how `average` returning `Option<f64>` makes the sparse-data fallback
+*type-safe*: "we don't have enough live data" is not a sentinel value or an
+error — it is `None`, and the compiler forces the caller to handle it. And
+`weight_millis` clamping speed away from zero is a quiet act of care: a segment
+gridlocked to a standstill must produce a huge weight, not a division by zero
+or an infinite crossing time that breaks Dijkstra's assumptions.
+
 === The reroute decision
 
 Section 2.13's state machine, reduced to its durable core: distance from the
 planned polyline, sustained across fixes. (Distance uses a local flat-earth
-approximation — within a few hundred meters of the route, curvature is noise;
-production systems run the full map-matching of Section 2.12 here.)
+approximation — within a few hundred meters of the route, the Earth's curvature
+is below GPS noise; production systems run the full map-matching of Section
+2.12 here.)
 
 ```rust
 /// Approximate meters-per-degree at a given latitude: 111.32 km per degree
@@ -1278,9 +1569,18 @@ mod tests {
 }
 ```
 
+The three tests are the three user stories: the normal drive (stay quiet), the
+genuine wrong turn (three strikes, then reroute), and the downtown ghost fix
+(suspect once, recover, never bother the driver). Forty lines of Rust, and the
+entire "what should happen when the user misses a turn?" discussion has a
+falsifiable answer.
+
 == Scaling & Geographic Sharding
 
-Chapter 1 defined sharding; here the shard key is *geography itself*.
+Chapter 1 defined sharding and warned that the art is in the key. Here the key
+chooses itself: *geography*. Every workload in this system is naturally located
+— tiles are places, segments are places, GPS fixes are places — and that makes
+the sharding table almost suspiciously clean:
 
 #tbl(
   (auto, 1fr, 1fr),
@@ -1295,91 +1595,133 @@ Chapter 1 defined sharding; here the shard key is *geography itself*.
   ),
 )
 
+Linger on the third row, because it is the one that looks like a problem and is
+not. "What about a route from Lisbon to Warsaw — two graph shards?" feels like
+it should force distributed queries. It does not, and the reason is beautiful:
+Section 2.8's hierarchy, which we built to make search fast, *also* makes
+distribution unnecessary. A Lisbon–Warsaw query climbs to the highway level
+inside the origin region's shard, crosses on mega-segments that span the border
+at a handful of highway gateways, and descends inside the destination shard.
+The algorithmic optimization and the scaling strategy are the same object.
+
 #insight([Geography is a forgiving shard key])[
-  Unlike user data (Chapter 1's documents), geography does not move, grow
-  legs, or go viral. A region's road graph changes on the scale of weeks; its
-  traffic weights change on the scale of minutes but are *regenerated*, not
-  migrated. The one genuinely hot spot — a stadium emptying at 11 p.m. — is
-  absorbed inside one partition by the aggregation pipeline, not spread across
-  the system.
+  Compare geography to Chapter 1's key — the document — and you will see why
+  this chapter's scaling story is calm. Documents grow legs: a shared document
+  can go viral, concentrate fifty editors, and migrate between owners.
+  Geography does none of that. A region's road graph changes on the scale of
+  weeks; its traffic weights change on the scale of minutes but are
+  *regenerated* in place, never migrated. The one genuinely hot spot — a
+  stadium emptying at 11 p.m. — is absorbed *inside* one partition by the
+  aggregation pipeline, not spread across the system. When your shard key is
+  this well-behaved, most of distributed systems' horror stories simply do not
+  apply to you.
 ]
 
 == Failure Modes & Recovery
+
+The enumeration, before the interviewer asks for it — with the pattern from
+Chapter 1 still in force: stateless things are replaced, stateful things are
+rebuilt from the log, and degradation is designed rather than improvised.
 
 #tbl(
   (auto, 1fr),
   header: (hcell[Failure], hcell[Handling]),
   body: (
-    [WS gateway dies], [Clients reconnect to any gateway; the connection manager re-registers them; the navigation service resumes pushes to the new socket. Unacked client updates are retried and deduplicated (Chapter 1's idempotency discipline).],
-    [Navigation node dies], [Sessions are small (route + progress). The client's reconnect carries its last known position; a fresh node rebuilds the session from the route store and continues. User sees a pause, not a crash.],
-    [Stream backpressure / Kafka lag], [Freshness degrades first and *visibly*: per-segment entries age past their TTL, and the system slides to historical speeds automatically — the fallback of Section 2.12 is the degradation mode, by design. Recovery replays the log.],
-    [Traffic cache loss], [Rebuilt from the stream within one window (~15 min); historical speeds serve in the meantime.],
+    [WS gateway dies], [Clients reconnect to any gateway; the connection manager re-registers them; the navigation service resumes pushes to the new socket. Unacknowledged client updates are retried and deduplicated — Chapter 1's idempotency discipline, unchanged.],
+    [Navigation node dies], [Sessions are small: a route plus progress along it. The client's reconnect carries its last known position; a fresh node rebuilds the session from the route store and continues. The user sees a pause, not a crash.],
+    [Stream backpressure / Kafka lag], [Freshness degrades first and *visibly*: per-segment entries age past their TTL, and the system slides to historical speeds automatically — Section 2.12's fallback is the degradation mode, by design, not by apology. Recovery replays the log.],
+    [Traffic cache loss], [Rebuilt from the stream within one window (~15 min); historical speeds serve in the meantime and nobody pages anyone.],
     [Routing node dies], [Each region shard is replicated; traffic shifts to a replica. A lost node reloads its graph from the segment store plus the traffic cache (Section 2.10).],
-    [Tile origin down], [The CDN keeps serving — 95%+ of requests never noticed the origin existed. `stale-while-revalidate` semantics make even expired tiles safe, since the base map changes weekly at worst.],
+    [Tile origin down], [The CDN keeps serving — 95%+ of requests never knew the origin existed. `stale-while-revalidate` semantics make even expired tiles safe, since the base map changes weekly at worst.],
     [Bad or spoofed GPS input], [Per-segment sample thresholds ignore singletons; per-source scoring quarantines systematically wrong feeds (Section 2.12).],
     [Full region outage], [The phone is the last fallback: cached route, tiles, and step list keep guiding offline (Section 2.13) while sessions re-home to another region.],
   ),
 )
 
+Read the third row twice. In most systems, "the pipeline is behind" is a
+page-worthy emergency. Here it is a *designed, user-visible, self-healing
+degradation*: colors fade to historical patterns, ETAs lean on Tuesday-8 a.m.
+instead of right now, and when the pipeline catches up, the live colors come
+back. The freshness NFR is what makes this softness possible — a system whose
+promise is "recent" can always fall back to "typical."
+
 == Trade-offs & Alternatives
+
+The ledger, benefit against cost, as always:
 
 #tbl(
   (auto, 1fr, 1fr),
   header: (hcell[Decision], hcell[Benefit purchased], hcell[Cost accepted]),
   body: (
-    [Vector tiles over raster], [~50% fewer bytes; restyle without re-render; smooth zoom], [Client GPU does the work; a raster fallback must exist for old clients],
-    [CH / mega-segments over plain A\*], [~1000× query speedup; the only way 20k QPS fits a small fleet], [Hours of preprocessing; shortcut weights must be rebuilt or bubbled-up when traffic moves — extra machinery (Section 2.8)],
-    [WebSocket push for navigation], [Reroutes and ETA updates arrive instantly; one connection also carries GPS upstream], [Millions of long-lived connections to hold and to register (connection manager)],
-    [Hybrid live + historical traffic], [Coverage everywhere, graceful under sparse data and pipeline lag], [Two data paths to keep consistent; blending logic to get right],
-    [Quadkey/geohash indexing], [Proximity becomes a string-prefix range scan in ordinary KV stores], [Cell-boundary artifacts — always query the neighbor ring too],
+    [Vector tiles over raster], [~50% fewer bytes; restyle without re-render; smooth zoom], [The client's GPU does the work; a raster fallback must exist for old clients],
+    [CH / mega-segments over plain A\*], [~1000× query speedup; the only way 20k QPS fits a small fleet], [Hours of preprocessing; shortcut weights must be rebuilt or bubbled up when traffic moves — extra machinery (Section 2.8)],
+    [WebSocket push for navigation], [Reroutes and ETA updates arrive instantly; one connection also carries GPS upstream], [Millions of long-lived connections to hold, and a registry (the connection manager) to find them],
+    [Hybrid live + historical traffic], [Coverage everywhere; graceful under sparse data and pipeline lag], [Two data paths to keep consistent, and blending logic to get right],
+    [Quadkey/geohash indexing], [Proximity becomes a string-prefix range scan in ordinary key-value stores], [Cell-boundary artifacts — a place just across a boundary is missed unless you always query the neighbor ring too],
     [Precompute over on-demand render], [Tiles and hierarchy make reads O(cache hit)], [A planet of batch jobs to run, version, and roll back],
   ),
 )
 
+The last row is the chapter's thesis wearing a cost column. Moving work off the
+request path bought us every latency number we promised — and the bill arrives
+as operational surface area: batch renderers, graph rebuilds, warehouse jobs,
+each with versions and rollbacks and monitors of their own. There is no free
+millisecond; there are only milliseconds you paid for in advance.
+
 == Observability & SLOs
+
+The accuracy requirement (±10% ETA) cannot be an aspiration; it must be a
+measured, per-city, per-hour number. That needs a metric:
 
 #defterm([MAPE (mean absolute percentage error)])[
   The average of `|predicted − actual| / actual` over many predictions — the
   standard accuracy metric for forecasts, and the natural SLI for ETA quality.
-  Per *completed* trip, we know both the ETA we gave and the realized travel
-  time, so ETA MAPE is measurable exactly, per city, per hour, per route class.
-  The source talk is emphatic on this point: you cannot improve what you do
-  not score, and ETA accuracy is the metric this product lives by.
+  Here we are unusually lucky: per *completed* trip, we know both the ETA we
+  gave and the travel time that reality delivered, so ETA MAPE is measurable
+  exactly, per city, per hour, per route class. The source talk is emphatic on
+  this point and it deserves the emphasis: you cannot improve what you do not
+  score, and ETA accuracy is the metric this product lives by.
 ]
 
-What we instrument, at minimum: *ETA error distribution* (predicted vs.
-realized, per region — the chapter's headline SLI, targeting the ±10% of
-Section 2.4); *route acceptance rate* (how often users actually drive the
-recommended route — a recommendation nobody takes is a signal something is
-wrong with the routes, per the talk's analytics discussion); reroute rate per
-session; tile cache hit ratio and origin QPS; route latency p50/p99; pipeline
-lag (fix → weight update); traffic freshness (median age of live segment
-speeds); navigation session drops and recovery times.
+Beyond MAPE, the dashboard that keeps this system honest: *route acceptance
+rate* — how often users actually drive the recommended route, because a
+recommendation nobody takes is a signal something is wrong with the routes (the
+talk's analytics discussion makes exactly this point); reroute rate per
+session, which is route quality measured by contradiction; tile cache hit ratio
+and origin QPS, guarding the 95% promise of Section 2.6; route latency p50/p99;
+pipeline lag from fix to weight update, the freshness SLI in seconds; median
+age of live segment speeds; and navigation session drop-and-recovery times,
+the 99.99% promise measured where the user feels it.
 
 == Interview Wrap-Up
 
-*Likely follow-ups, with one-line answers:*
+The likely follow-ups, with the shape of a strong answer for each:
 
-- _"Offline maps?"_ — Ship regional bundles (tiles + contracted graph) to the
-  device; routing runs locally; traffic and reroute quality silently degrade
-  until reconnect. Everything we precomputed server-side is exactly what the
-  bundle contains.
-- _"Public transit?"_ — A *time-dependent* graph (edges exist only when a
-  vehicle does); Dijkstra generalizes, but production transit uses
-  schedule-based algorithms (RAPTOR and friends). Name it, don't build it.
-- _"GPS noise in urban canyons?"_ — The HMM map-matching of Section 2.12, plus
-  sensor fusion (accelerometer, gyroscope, wheel ticks where available).
+- _"Offline maps?"_ — Ship regional bundles (tiles plus the contracted graph)
+  to the device; routing runs locally; traffic and reroute quality silently
+  degrade until reconnect. Notice that everything we precomputed server-side is
+  *exactly* what the bundle contains — the theme of precomputation, one final
+  time.
+- _"Public transit?"_ — A *time-dependent* graph, where edges exist only when
+  a vehicle does. Dijkstra generalizes, but production transit uses
+  schedule-based algorithms (RAPTOR and friends). Name it, admire it, do not
+  build it in the interview.
+- _"GPS noise in urban canyons?"_ — The hidden-Markov map-matching of Section
+  2.12, plus sensor fusion: accelerometer, gyroscope, and wheel ticks where the
+  vehicle offers them.
 - _"Better ETAs?"_ — Features into a learned model: current and historical
-  speeds, weather, events, turn and signal penalties; graph neural networks
+  speeds, weather, events, turn and signal penalties; graph neural networks can
   model congestion *spreading* along the road graph. Google reported up to ~50%
-  ETA-error reductions in some cities from exactly this move — say the number
-  as motivation, then defend the simple hybrid as the baseline it must beat.
+  ETA-error reductions in some cities from exactly this move. Say the number as
+  motivation, then defend the simple hybrid of Section 2.12 as the baseline any
+  model must beat.
 - _"Walking and cycling?"_ — Same graph, same algorithms, different edge
-  eligibility and weights (stairs, bike lanes, no highways). The design's
-  generality is the answer.
-- _"Location privacy?"_ — Aggregate, don't store: segment statistics instead
-  of traces, retention limits on raw updates, minimum sample counts that double
-  as k-anonymity for sparse segments.
+  eligibility and weights: stairs, bike lanes, no highways. The design's
+  generality *is* the answer.
+- _"Location privacy?"_ — Aggregate, don't store: segment statistics instead of
+  traces, retention limits on raw updates, and minimum sample counts that
+  double as k-anonymity for sparse segments. Section 2.12's design made the
+  private choice the convenient one — point that out.
 
 *If you remember five things:*
 
@@ -1388,8 +1730,8 @@ speeds); navigation session drops and recovery times.
 + Roads are a time-weighted directed graph, and *traffic is just edge weights
   that move*.
 + Dijkstra is exact and unusable; bidirectional and A\* are free wins;
-  hierarchy (mega-segments / contraction hierarchies) is the ~1000× that makes
-  it a product.
+  hierarchy (mega-segments, contraction hierarchies) is the ~1000× that turns
+  an algorithm into a product.
 + Live traffic is a streaming pipeline: GPS fix → map-match → per-segment
   windowed average → weights and overlay tiles, with history as the fallback.
 + Navigation correctness lives on the phone: the client caches the route and
@@ -1397,14 +1739,15 @@ speeds); navigation session drops and recovery times.
 
 == Summary & Further Reading
 
-We designed a maps and navigation service for 1B monthly users: a
+We designed a maps and navigation service for 1B monthly users, and — if the
+chapter did its job — every piece felt *derived* rather than invented: a
 pre-rendered, CDN-served tile pyramid addressed by `(z, x, y)` and quadkeys; a
 time-weighted road graph held in memory and searched with an algorithm ladder
 that ends at contraction hierarchies; a live traffic loop that turns 3M GPS
 updates per second into per-segment speeds, edge weights, and overlay tiles,
 with historical patterns as the fallback; and a turn-by-turn navigation service
-that guides, refreshes ETAs, and reroutes with hysteresis — degrading to the
-phone when the network or we fail.
+that guides, refreshes ETAs, and reroutes with hysteresis — degrading
+gracefully to the phone when the network, or we, fail.
 
 *Primary source for this chapter:*
 - #link("https://www.youtube.com/watch?v=1pmcoh4hc_A")[*"13: Google Maps" — Systems Design Interview Questions With Ex-Google SWE (Jordan has no life)*] — the walkthrough this chapter expands.
@@ -1413,7 +1756,7 @@ phone when the network or we fail.
 - The OSRM and Valhalla open-source routing engines — contraction hierarchies in production code, not just papers.
 - Geisberger et al., _Exact Routing in Large Road Networks Using Contraction Hierarchies_ (2008) — the CH formulation.
 - Newson & Krumm, _Hidden Markov Map Matching Through Noise and Sparseness_ (2009) — the map-matching standard.
-- Google's S2 geometry library documentation, and Uber's H3 — the real spatial indexes behind quadkey-style addressing.
+- Google's S2 geometry library documentation, and Uber's H3 — the real spatial indexes behind quadkey-style addressing (Chapter 12 uses H3's geohash cousin directly).
 - The Bing Maps tile system documentation — the canonical quadkey reference.
 - Google DeepMind's write-up on learning ETAs with graph neural networks (2020) — the ML direction for Section 2.19's follow-up.
 
@@ -1457,3 +1800,8 @@ assumed; later chapters assume both.
     [MAPE], [Mean absolute percentage error; the ETA accuracy SLI],
   ),
 )
+
+#v(1.2em)
+#align(center)[#text(fill: slate, size: 9.5pt)[
+  — End of Chapter 2 · Next: Chapter 3 —
+]]

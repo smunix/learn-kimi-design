@@ -37,12 +37,20 @@ The interviewer looks up and says:
   ]
 ]
 
-The previous chapters designed systems that *serve users*. This one designs the
-system that watches all of them — including, recursively, the ones from
-Chapters 1–3. It is a data pipeline problem wearing an operations costume: an
-enormous, never-ending write stream on one side, and on the other a handful of
-humans asking very expensive questions at the worst possible moment (during an
-outage, when both data volume and query volume spike together).
+Feel how different this prompt is from everything before it. Chapters 1
+through 3 designed systems that *serve users* — editors, maps, API
+infrastructure. This chapter designs the system that *watches all of them* —
+including, recursively, the very systems you built in those chapters. Your
+"users" now are other engineers, and they show up at the worst possible
+moment: during an outage, stressed, impatient, asking very expensive
+questions of your data. And here is the cruel twist that should shape your
+whole design intuition: at that same moment, the fleet you are watching is
+also screaming — error storms, stack traces, retry floods. The system's
+busiest day and its most important day are *the same day*. Strip away the
+operations vocabulary and what remains is a data pipeline problem: an
+enormous, never-ending write stream on one side, and on the other a handful
+of humans issuing rare, costly, latency-sensitive queries. Almost every
+decision in this chapter flows from that asymmetry, so hold onto it.
 
 #defterm([Observability / telemetry])[
   The ability to answer questions about a system's internal state from its
@@ -52,6 +60,13 @@ outage, when both data volume and query volume spike together).
   request through many services). This chapter designs the platform for the
   first two; traces are a follow-up (Section 4.18).
 ]
+
+Notice the definition's one hard constraint: you may only use *outputs*. You
+cannot pause a production service at 3 a.m. and inspect its variables; the
+telemetry it already emitted is the only evidence that will ever exist. That
+is why durability shows up later as a first-class requirement rather than a
+nicety — a log line dropped at emission is not delayed evidence, it is
+*destroyed* evidence, and the investigation it would have closed stays open.
 
 #defterm([Log vs. metric])[
   A _log record_ is a discrete, semi-structured event: "at 03:14:22.017,
@@ -64,7 +79,21 @@ outage, when both data volume and query volume spike together).
   this chapter (Section 4.6).
 ]
 
+One more intuition before we scope: read those two examples again and ask
+yourself which one you would want *during* an incident and which you would
+want *before* it. Metrics tell you something is wrong — a red line bending
+the wrong way, often minutes before any user complains. Logs tell you *why*
+— the precise exception, on the precise host, for the precise request.
+Metrics are the smoke detector; logs are the fire investigation. A platform
+that stored only one would leave you either unaware or helpless, and the
+engineering consequence is that you are really designing two storage systems
+that happen to share a firehose. Section 4.6 makes that fork explicit.
+
 == Scope & Clarifying Questions
+
+The prompt is enormous — "log and measure everything, forever, for everyone"
+— so your first job is to shrink it to something designable. Watch the
+dialogue and, as always, pay attention to what each answer *buys*:
 
 #tbl(
   (auto, 1fr),
@@ -85,6 +114,25 @@ outage, when both data volume and query volume spike together).
   ),
 )
 
+Six answers, six load-bearing decisions. The first carves tracing out of
+scope but plants a constraint you should honor cheaply — "don't preclude it"
+is why trace ids will reappear in Section 4.18 as a bolt-on rather than a
+rebuild. The fleet size (50k instances) is the number that makes manual,
+per-service anything impossible and forces the *agent* model of Section 4.7.
+The freshness targets (60 s logs, 30 s metrics) are interesting precisely
+because they are *not* milliseconds: unlike Chapter 3's limiter, nothing here
+sits on a user-facing critical path, which means you are allowed — even
+encouraged — to trade seconds of delay for enormous throughput. That
+permission is what makes the buffer-first architecture possible. The
+retention answer hands you a cost model disguised as a policy: "nobody needs
+15-second resolution from last year" is an engraved invitation to
+*downsample*, and Section 4.9 accepts it. The loss answer gives you a
+degradation contract you must quote back later: metrics may shed, logs must
+never vanish silently. And the query answer contains the seed of the whole
+availability philosophy — dashboards refresh *continuously*, but searches
+*spike during incidents*, which is the correlated-load problem from the
+problem statement, now confirmed by the person grading you.
+
 #block(fill: faint-blue, radius: 6pt, inset: (x: 14pt, y: 10pt), width: 100%)[
   #set text(size: 9.2pt)
   #text(font: ("Noto Sans", "DejaVu Sans"), size: 8pt, weight: "bold", fill: primary, tracking: 0.1em)[AGREED SCOPE]
@@ -97,6 +145,13 @@ outage, when both data volume and query volume spike together).
 ]
 
 == Functional Requirements
+
+Six promises this time, and as you read them, notice how they partition into
+three pairs: two about getting data *in* (FR-1, FR-5), two about getting
+answers *out* (FR-2, FR-3), and two about the platform being a *product* for
+engineers rather than a pile of infrastructure (FR-4, FR-6). A design that
+nails the pipeline but forgets the humans paging through it at 3 a.m. has
+failed the prompt.
 
 + *FR-1 — Collection.* Every instance's logs and metrics flow to the platform
   automatically, within seconds of emission, with no per-service plumbing by
@@ -114,7 +169,23 @@ outage, when both data volume and query volume spike together).
 + *FR-6 — Self-service config.* Teams register services, set retention, and
   define alerts through an API/UI — the platform team is not in the loop.
 
+Two of these deserve a beat. FR-1's phrase "no per-service plumbing" is doing
+enormous work: with 50,000 instances, any collection scheme that requires
+engineers to modify their services will be adopted by a fraction of them, and
+unobserved services are exactly the ones whose failures surprise you.
+Collection must be something the *environment* provides, which is why
+Section 4.7 puts a daemon on every host rather than a library in every
+service. And FR-4's "once, not repeatedly" sounds like politeness; it is
+actually the hardest engineering constraint in the chapter, because a paging
+system that cries wolf trains its humans to ignore it, and an ignored pager
+is strictly worse than no pager — you pay the operational cost and get none
+of the safety. Section 4.12 exists almost entirely to honor those four words.
+
 == Non-Functional Requirements
+
+Before the table, one term needs its own definition, because the word
+"freshness" already meant something different in Chapter 2 and you should not
+let the two meanings blur:
 
 #defterm([Ingestion latency (freshness, telemetry sense)])[
   The time from an event being emitted on a host to it being *queryable*.
@@ -122,6 +193,14 @@ outage, when both data volume and query volume spike together).
   Our targets: logs ≤ 60 s, metrics ≤ 30 s — fast enough that an engineer
   watching a deploy sees its effect while watching.
 ]
+
+That last clause is the real requirement hiding inside the numbers. "Fast
+enough to watch a deploy" is a *human-loop* criterion: an engineer rolls out
+a change, stares at a dashboard, and needs the graph to answer "better or
+worse?" within one attention span. Nobody negotiated 60 seconds because the
+machines need it; they negotiated it because human patience during an
+incident is about a minute. When you derive requirements from the humans
+they serve, you get numbers you can defend.
 
 #tbl(
   (auto, 1fr),
@@ -136,15 +215,35 @@ outage, when both data volume and query volume spike together).
   ),
 )
 
+Walk the rows and watch them disagree with each other — the disagreements
+are the design. Throughput says millions of writes per second; query latency
+says interactive reads; durability says lose nothing; cost says store it for
+cheap. You cannot have all four maximally, and the rows themselves tell you
+how to split the difference: durability attaches to *logs* while metrics are
+explicitly loss-tolerant, and the availability row makes a ranking you should
+say out loud in the interview — *the ingestion path outranks the query
+path*. If forced to choose, a platform that keeps recording but answers
+slowly is a black-box flight recorder doing its job; a platform that answers
+instantly but stopped recording an hour ago is a museum. Queries can catch up
+later; unrecorded history cannot be re-created. That one ranking decision
+will show up again as the buffer-first architecture of Section 4.11.
+
 #insight([The system's worst day is everyone else's])[
   When the fleet has an incident, two things happen at once: services emit
   *more* telemetry (error storms, stack traces) and engineers query *harder*
   (everyone opens dashboards). The platform must be sized for the correlated
   spike — the day it is needed most is the day it is loaded most. This
-  observation drives the buffer-first architecture of Section 4.11.
+  observation drives the buffer-first architecture of Section 4.11. Most
+  systems get to choose between capacity planning for average load or peak
+  load; this system's peak load arrives correlated with its peak
+  *importance*, so the choice is made for you. A telemetry platform sized
+  for the average is a platform that dies exactly when it is needed.
 ]
 
 == Back-of-the-Envelope Estimation
+
+Now quantify the firehose, because the numbers are going to make two
+architecture decisions for you before Section 4.6 even starts.
 
 *Assumptions:*
 
@@ -172,6 +271,15 @@ outage, when both data volume and query volume spike together).
   ),
 )
 
+Do not skim past the third and sixth rows — hold them side by side and let
+the absurdity sink in. Logs: a hundred and seventy *terabytes per day*.
+Metrics, thirteen months, *after* rollups: tens of terabytes *total*. One of
+your two data classes produces more raw data *every day* than the other
+produces in its *entire retention window*. Same pipeline, same fleet, same
+chapter — three orders of magnitude apart. If someone proposes storing these
+two things the same way, the estimation table has already refuted them; you
+just have to read it out loud.
+
 #insight([What the math tells us])[
   Two facts shape everything. First, *logs are the cost center*: ~170 TB/day
   raw versus metrics' ~120 GB/day — three orders of magnitude apart. Storage
@@ -179,13 +287,21 @@ outage, when both data volume and query volume spike together).
   storage design for metrics is *query-shape* design (fast range scans over
   tiny values). Second, the write rate utterly dwarfs the query rate, so the
   system is organized as a pipeline: absorb first, index second, query third.
+  Notice that neither fact came from cleverness — they fell out of
+  multiplication. This is why you always estimate before you design: the
+  envelope tells you which problems are big, and big problems are the only
+  ones worth architecture.
 ]
 
 == The Core Challenge: One Firehose, Two Shapes of Data
 
-Logs and metrics arrive on the same wire from the same hosts — and must part
-ways immediately, because they are different kinds of data with different query
-patterns and different economics:
+Here is the chapter's central tension, stated as plainly as possible: logs
+and metrics arrive on the same wire, from the same hosts, carried by the
+same agents — and they must part ways almost immediately, because everything
+about them is different. Not just their formats: their *economics*, their
+*query patterns*, even their *relationship to loss*. The table below is the
+whole argument; every row justifies the fork you will see in the
+architecture:
 
 #tbl(
   (auto, 1fr, 1fr),
@@ -200,15 +316,38 @@ patterns and different economics:
   ),
 )
 
+Read the last row twice, because it is the one candidates fumble. A missing
+log line during an incident is a hole in the evidence — and investigators
+*notice holes*, because the gap always seems to be exactly where the root
+cause was hiding. A missing metric *sample*, by contrast, is one absent point
+in a series of thousands; every aggregate you compute barely moves, and the
+dashboard's line barely flickers. This asymmetry is a gift: it tells you
+exactly which data class to sacrifice first when the pipeline is drowning
+(Section 4.15's degradation order), and it came straight from the
+interviewer's own answer in Section 4.2.
+
 #pitfall([One store for both])[
   The classic junior move: "just put it all in one database." Indexing metrics
   as log lines wastes the log pipeline's expensive text machinery on tiny
   numbers; storing logs in a time-series engine forfeits text search entirely.
   The chapter's architecture forks *right after the buffer* into two
   purpose-built stores — Section 4.8 and 4.9 exist because this fork exists.
+  If an interviewer challenges the fork ("isn't two stores twice the
+  operational burden?"), the answer is yes — and worth it, because the
+  alternative is one store that is bad at both jobs: the table above shows
+  the two workloads disagree on volume, query shape, *and* loss tolerance,
+  so any single engine must betray at least one of them.
 ]
 
 == Data Ingestion: Agents, Push vs. Pull, and the Buffer
+
+How does telemetry physically leave 50,000 instances? Your first instinct
+might be "services send it" — a library in every application, an SDK, a
+handful of import statements. Kill that instinct quickly, because FR-1 killed
+it: with 50k services written by hundreds of teams in a dozen languages, any
+scheme requiring per-service work guarantees patchy adoption, and patchy
+observability is a trap worse than none — you stop trusting your own
+dashboards. The answer is to move collection out of the services entirely:
 
 #defterm([Telemetry agent])[
   A small daemon running on every host (or beside every workload as a
@@ -219,8 +358,19 @@ patterns and different economics:
   endpoint; the agent does the rest.
 ]
 
+Two deployment facts make this work, and both are worth saying aloud.
+`stdout` and a `/metrics` endpoint are *conventions*, not integrations — a
+service gets observed the moment it is scheduled onto a host, with zero code
+changes, which is the only adoption curve that reaches 100%. And the agent
+is owned by *your* team, the platform team — so batching policy,
+compression, buffering, and upgrades roll out centrally instead of waiting
+on fifty thousand dependency bumps. You have converted an adoption problem
+into an operations problem, and operations problems are the kind platform
+teams can actually solve.
+
 The one genuine design fork in collection is *who initiates the metrics
-transfer*:
+transfer* — and this is a question with a real answer in the industry, so
+learn both sides well enough to argue either:
 
 #defterm([Push vs. pull (scrape)])[
   _Push_: the source (or its agent) sends metrics upstream when it has them.
@@ -233,6 +383,19 @@ transfer*:
   for services, push gateways for batch jobs.
 ]
 
+Savor the up/down detection point, because it is the deepest argument in the
+exchange. Under pull, a target that stops answering *generates information*:
+the collector's missed scrape is itself a health signal, for free, on a
+schedule you control. Under push, silence is ambiguous — is the service down,
+or merely quiet? Distinguishing the two requires extra machinery
+(heartbeats, timeouts on staleness) that pull gets as a side effect of
+asking. That single asymmetry is why the industry's default for services is
+pull. But then run the reverse case: a batch job that lives for forty
+seconds can die between scrapes and take its metrics to the grave — for
+those, push is the only honest option. "Pull for services, push for batch
+jobs" is not a compromise; it is each model deployed where its weakness
+cannot bite.
+
 #defterm([Backpressure])[
   What a pipeline does when a downstream stage is slower than upstream: the
   pressure must propagate backward and be *absorbed somewhere* — a queue grows,
@@ -243,24 +406,49 @@ transfer*:
   4.2's degradation agreement).
 ]
 
+Here is the mental model that makes backpressure intuitive: a pipeline with
+no shock absorber is *rigid*, and rigid systems transmit force. If the log
+indexer slows down and nothing absorbs the difference, the slowness travels
+upstream at the speed of TCP until it reaches the agents — and then, if the
+agents have nowhere to put data, it reaches *the application hosts
+themselves*. Your observability platform has just become a source of
+production outages, which is the one failure mode you can never be forgiven
+for. Every stage of the design below is an answer to the question "where
+does the pressure go?"
+
 #insight([The buffer is the shock absorber])[
   A Kafka-class log (Chapter 2) between agents and processors buys four things
   at once: spikes are absorbed (the incident-storm insight of Section 4.4);
   indexing can lag and replay after outages; a bad deploy of the indexing fleet
   costs *lag*, not data; and new consumers (the future tracing pipeline, a
   billing tap) attach without touching producers. Decoupling ingestion from
-  indexing is the single highest-leverage decision in the chapter.
+  indexing is the single highest-leverage decision in the chapter. When an
+  interviewer asks what one component you would fight to keep, it is this
+  one — and the reason is that the buffer converts *failure domains* into
+  *lag domains*: downstream outages stop being data loss and become a
+  number (consumer lag) you can watch recover.
 ]
 
-And a deliberate callback: the buffer's tenants are protected from each other
-with per-team *ingestion quotas* — Chapter 3's rate limiter, applied to
-telemetry. One team's debug-level flood must not evict everyone else's logs.
+And a deliberate callback, because platforms compound: the buffer's tenants
+are protected from each other with per-team *ingestion quotas* — Chapter 3's
+rate limiter, applied to telemetry. One team's debug-level flood must not
+evict everyone else's logs. When you say this in the interview, name the
+connection explicitly; showing that last chapter's design is a *component* of
+this one is exactly the kind of cross-system fluency that separates staff
+engineers from diagram reciters.
 
 == Log Storage: The Inverted Index
 
-Log search answers "find the records containing these tokens, in this time
-range, with these field values, among billions of records" in seconds. A scan
-is impossible; the index must be inverted.
+Now follow the log fork of the firehose into its store. Log search must
+answer "find the records containing these tokens, in this time range, with
+these field values, among billions of records" in seconds. Sit with that
+requirement for a moment and let it eliminate options. A scan is impossible
+— 170 TB/day laughs at scans. A hash index is useless — queries are about
+*containment* of tokens, not equality of keys. What remains is the structure
+every text engine since the 1960s has converged on, and you should be able
+to derive it on the spot: if queries ask "which records contain token X?",
+then at write time you must build the answer to exactly that question — a
+map from tokens to records.
 
 #defterm([Inverted index / posting list])[
   The data structure behind every text search engine: a map from *token* to the
@@ -272,6 +460,17 @@ is impossible; the index must be inverted.
   the inverted index prices exactly that.
 ]
 
+Internalize the workload characterization, because it is the defense of the
+whole design. You pay indexing cost on *every one* of ten million writes per
+second so that a query asked perhaps a few thousand times a day answers in
+seconds. Is that insane? Only if reads and writes were symmetric — they are
+not. The alternative ("schema-on-read": store raw, grep at query time) moves
+the cost to the read side, which sounds thrifty until the read is a paged
+engineer waiting for a scan of a petabyte at 3 a.m. Writes are cheap because
+they are amortizable, parallelizable, and never urgent; reads are expensive
+because a human is staring at them. The inverted index is what "spend write
+capacity to buy read latency" looks like as a data structure.
+
 #defterm([Tokenization / structured logging])[
   _Tokenization_ splits raw text into searchable terms (lower-cased, split on
   punctuation). _Structured logging_ emits logs as JSON records —
@@ -281,24 +480,37 @@ is impossible; the index must be inverted.
   and sampling smarter, and FR-6's self-service story nudges teams toward it.
 ]
 
-Three storage decisions carry the load:
+Three storage decisions carry the load — and as you read them, notice that
+each one converts a *requirement* into a *mechanism*:
 
 + *Immutable segments, merged in the background.* Incoming records are buffered
   into small index *segments* written to disk immutably; a background process
   merges small segments into larger ones. Appends and merges are sequential
   I/O — the cheapest disk work there is (same lesson as Chapter 1's operation
-  log).
+  log). Immutability is the quiet superpower here: a segment never changes
+  once written, so it can be cached, replicated, checksummed, and merged
+  without a single lock.
 + *Sharding by time.* The index is partitioned into time buckets (e.g., one
   index per day per tenant class). Queries prune whole days by timestamp before
   touching a posting list — and *retention becomes deletion of an old index
   file*, not a billion per-record deletes. Time-sharding turns FR-5 into `rm`.
+  Compare this with the naive alternative — issuing per-record deletions
+  against a live index, fragmenting posting lists and burning I/O to destroy
+  data nobody wanted — and you will never design retention any other way.
 + *Hot / warm / cold tiers.* Today's indices live on fast SSD nodes with
   replicas (hot); last week's on cheaper nodes (warm); months-old data as
   compressed archives in object storage (cold), rehydrated on the rare
   historical query. Cost per GB falls by an order of magnitude per tier —
-  Section 4.5 made clear this *is* the design.
+  Section 4.5 made clear this *is* the design. The tiers work because of a
+  statistical mercy: engineers overwhelmingly query *recent* data (the
+  incident is always now), so the expensive hardware only ever has to hold
+  the small, hot slice of history.
 
 == Metrics Storage: The Time-Series Database
+
+Across the fork, the metrics stream needs the opposite kind of store. Where
+logs demanded text machinery, metrics demand *numerical* machinery — and the
+first concept you need is the atom of the whole pillar:
 
 #defterm([Time series / sample / label set])[
   A _time series_ is a named, labeled sequence of *(timestamp, value)* pairs:
@@ -316,10 +528,18 @@ Three storage decisions carry the load:
   queries scanning garbage. Rule of thumb: a label whose value set grows with
   *traffic or users* does not belong on a metric; it belongs in a log or a
   trace. Every metrics interview eventually arrives here — arrive first.
+  And if the interviewer asks why one innocent-looking label can hurt the
+  *whole cluster*, give the real answer: series indices are shared
+  infrastructure, so one team's `user_id` label is a denial-of-service
+  attack on everyone's dashboards — which is why Section 4.15 enforces
+  per-metric cardinality budgets at write time.
 ]
 
-Why a purpose-built store: samples of one series arrive in time order and
-change slowly, so they compress almost to nothing:
+Why a purpose-built store at all? Because samples of one series arrive in
+time order and change slowly, and data with that shape compresses almost to
+nothing — *if* your storage engine is built to notice. A general-purpose
+database stores each sample as a row and pays row overhead for it; a
+time-series engine exploits the regularity:
 
 #defterm([Delta encoding / delta-of-delta])[
   Store differences, not values. Timestamps sampled every 15 s delta-encode to
@@ -330,6 +550,15 @@ change slowly, so they compress almost to nothing:
   4.13 implements the delta+zigzag+varint core of the idea.
 ]
 
+Take the compression seriously as a *design argument*, not a trivia fact.
+Remember Section 4.5's estimate: 0.7M samples/s × 86,400 s is ~60 billion
+samples a day. At 16 uncompressed bytes that is a petabyte a year; at 1.4
+compressed bytes it is a rack's worth of disks. The compression ratio is not
+an optimization you apply later — it is the difference between a feasible
+design and an unfundable one. This is the same pattern you saw in Chapter
+3's estimation table, wearing new clothes: *what you choose to store* is the
+cost model.
+
 #defterm([Downsampling / rollup])[
   Replacing old high-resolution samples with precomputed aggregates — keep
   15-second resolution for a week, 1-minute for a quarter, 1-hour beyond:
@@ -338,13 +567,30 @@ change slowly, so they compress almost to nothing:
   retention from a petabyte problem into a terabyte one.
 ]
 
+Rollups deserve one skeptical question, because the interviewer will ask it:
+"if you throw away the raw samples, what did you lose?" The honest answer:
+the ability to ask *new questions at old resolution* — you can never
+recompute last quarter's 99th-percentile at 15-second granularity from
+hourly averages. You accept this because the interviewer already told you
+(in Section 4.2's retention answer) that nobody needs it, and because the
+aggregates you *do* keep were chosen to be the ones capacity reviews and
+trend analyses actually consume. Trade-offs stated this precisely are
+unassailable.
+
 Queries are then range scans over compressed blocks, sharded by metric-name
-hash: fetch the blocks for matching series in the range, decompress, aggregate.
-Dashboard panels are exactly this, cached and refreshed.
+hash: fetch the blocks for matching series in the range, decompress,
+aggregate. Dashboard panels are exactly this, cached and refreshed — which
+means the entire dashboarding product, with all its Grafana glamour, reduces
+to "a cache in front of a range scan." Saying that out loud in an interview
+is a delightful way to demystify a billion-dollar product category.
 
 == API & Query Design
 
-Three surfaces — ingestion, query, config — each deliberately boring:
+Three surfaces — ingestion, query, config — each deliberately boring. That
+word choice is a compliment you should learn to pay: after chapters of
+exotic protocols, the correct answer here is plain HTTP with obvious
+endpoints, because an observability platform's API is operated at 3 a.m. by
+humans under stress, and boring APIs fail in boring, debuggable ways.
 
 #tbl(
   (auto, auto, 1fr),
@@ -359,6 +605,15 @@ Three surfaces — ingestion, query, config — each deliberately boring:
   ),
 )
 
+Two rows repay attention. The logs:batch endpoint takes *compressed batches*,
+not individual records — at 10M events/s, per-record HTTP would spend more
+bytes on headers than on data, and batching is where the agent earns its
+keep (amortizing connection costs across thousands of records). And the
+alerts endpoint is *versioned like Chapter 3's rules* — the same pattern you
+just learned for limiter config reappears here unchanged, because "config
+that pages humans" has the same lifecycle needs as "config that rejects
+traffic": reviewable, reversible, pushable.
+
 Query languages, sketched to show the shape (not to design in full):
 
 ```text
@@ -370,11 +625,26 @@ rate(http_requests_total{service="checkout", status=~"5.."}[5m])
   |> sum by (region)
 ```
 
+Read the two examples as the two data models asserting themselves in syntax.
+The log query is a *filter*: it selects records and shows them to a human,
+and the time range is a first-class citizen because log questions are always
+anchored in an incident's timeline. The metrics query is a *computation*:
+select series, take a rate over a window, then aggregate across a label
+dimension. Notice it returns one number per region — the raw samples are
+nobody's destination. If an interviewer asks you to design the query
+language itself, this contrast is your thesis: logs want search grammar,
+metrics want an algebra of aggregations.
+
 Alert rules are records: `{ name, query, threshold, comparison, for_duration,
 severity, notify_channels }` — evaluated by the alerting engine of Section
-4.12.
+4.12. Keep the `for_duration` field in view; it looks like a detail and is
+actually the load-bearing anti-flapping mechanism you are about to study.
 
 == High-Level Architecture
+
+Every decision so far — agents everywhere, one durable buffer, two
+purpose-built stores, humans at the far end — assembles into a single
+pipeline. Here it is, drawn as the data experiences it:
 
 #v(0.3em)
 #align(center)[
@@ -422,6 +692,62 @@ severity, notify_channels }` — evaluated by the alerting engine of Section
 ]]
 #v(0.2em)
 
+Walk the diagram in data order — write path first, read path second, control
+path last — because that ordering is also the correct order in which to
+*present* the architecture in an interview, and practicing the narration is
+half the value of the picture.
+
+*The write path* runs along the top edge. At top-left, the 50,000 service
+instances emit the only two things FR-1 requires of them: text to stdout and
+a `/metrics` endpoint. The next box, *telemetry agents*, is where your
+platform first touches the data — tailing the log files, scraping the
+endpoints, batching and compressing. Then comes the arrow labeled "2 GB/s"
+into the *buffer*, and this is the moment to slow your narration down: that
+arrow is where the entire incident-storm insight of Section 4.4 lives. The
+buffer (a Kafka-class durable log, ~200 partitions over ~20–30 brokers per
+Section 4.5) absorbs whatever the fleet throws at it — including the 3×
+error-storm spike — and durably holds it, so that everything downstream can
+be slow, crashed, or mid-deploy without losing a byte. Immediately after the
+buffer, the diagram performs its central act: the two teal arrows forking
+downward, labeled "fork by data class." Left fork: the *log indexer*
+consumes the log stream, tokenizes, and builds the immutable inverted-index
+segments of Section 4.8, writing them into the *log index cluster* with its
+hot/warm/cold tiers. Right fork: the *metrics writer* consumes the sample
+stream, compresses it with Section 4.9's delta machinery, maintains rollups,
+and lands compressed blocks in the *TSDB*. One firehose in, two stores out —
+Section 4.6's table, made spatial.
+
+*The read path* is the bottom row, read right-to-left from the human's
+perspective. An engineer opens the *dashboards & search UI*; their request
+hits the *query layer*, whose job is federation — a log search is routed to
+the log index, a PromQL-ish expression to the TSDB, and a dashboard mixing
+both panels fans out to both and merges. The two slate arrows angling up
+from the query layer to each store are those federated sub-queries. Note
+what the query layer also owns but the diagram cannot show: *caching* of
+dashboard panels, which is what absorbs the "two thousand engineers open the
+same dashboard at once" read spike from Section 4.4. And the *alerting
+engine* sits on this row too — deliberately drawn reading from the stores
+(dashed crimson arrow) exactly like a tireless engineer issuing a query every
+15–60 seconds, because that is precisely what it is. When a rule fires, the
+solid crimson arrow carries the notification to *Notify* — page, chat,
+email — the platform's only truly write-facing act toward humans.
+
+*The control path* is the amber column at far right: the *config* service
+holds alert rules, retention policies, and quotas, and a dashed amber arrow
+runs down its side fanning config out to the components that need it —
+Chapter 3's lesson (config is pushed, never fetched on a hot path) applied
+without modification.
+
+Now the exercise that makes the picture yours: remove each box mentally and
+name what breaks. Remove the buffer and every downstream hiccup becomes
+upstream data loss — Section 4.7's rigidity argument. Remove the fork and
+you are back in the one-store pitfall of Section 4.6. Remove the query layer
+and every dashboard client grows federation logic, duplicated and drifting
+across teams. Remove the alerting engine's independent infrastructure (not a
+box, but a property Section 4.12 will stress) and the one outage that must
+page is the one that cannot. Every box is load-bearing; that is what makes
+it an architecture rather than a parts list.
+
 #tbl(
   (auto, 1fr, 1fr),
   header: (hcell[Component], hcell[Responsibility], hcell[Why it is shaped this way]),
@@ -438,12 +764,24 @@ severity, notify_channels }` — evaluated by the alerting engine of Section
   ),
 )
 
+The right-hand column is your oral defense, one sentence per box. Two rows
+share a phrase worth noticing — the log indexer and metrics writer are both
+"stateless consumers" of buffer topics. That is not laziness of vocabulary;
+it is the scaling story of Section 4.14 in seed form. Stateless consumers
+scale by adding instances and rebalancing partitions, which means the
+processing tier's capacity plan is "autoscale on consumer lag" — a metric
+the buffer gives you for free.
+
 == Deep Dive: The Alerting Engine
 
-Alerting is where the metrics store earns its keep. The engine's loop is
-trivially stated — *every evaluation interval (15–60 s), run every rule's
-query, compare against the threshold* — and the difficulty is entirely in not
-crying wolf.
+Alerting is where the metrics store earns its keep — and where the platform
+earns its *reputation*. Think about what an alert is from the receiving end:
+it is the only message in the company authorized to wake a human. Abuse that
+authority with noisy, flapping, repeating pages, and within a quarter your
+engineers will have muted the channel, at which point you have built a
+very expensive no-op. The engine's loop is trivially stated — *every
+evaluation interval (15–60 s), run every rule's query, compare against the
+threshold* — and the difficulty is entirely in not crying wolf.
 
 #defterm([Flapping / hysteresis / "for" duration])[
   _Flapping_: an alert that oscillates OK → FIRING → OK → FIRING as the metric
@@ -456,7 +794,20 @@ crying wolf.
   failure mode*, and it is engineered against, exactly like throughput.
 ]
 
-The per-rule state machine:
+Understand *why* each cure works, not just what it is. The `for` duration
+exploits a statistical fact: real outages are *sustained* (a dependency is
+down, a deploy is bad), while threshold-crossing noise is *brief* (one
+garbage-collection pause, one slow retry). Requiring continuity is a cheap
+classifier that separates the two with almost no machinery. Hysteresis solves
+a different problem: a metric hovering *exactly at* the threshold crosses it
+every evaluation, so any single boundary line is a flap generator; splitting
+entry and exit into two different lines makes oscillation require a real
+swing, not a tremor. Borrowed from thermostats and Schmitt triggers, it is
+one of those ideas that proves the same mathematics keeps rescuing different
+fields.
+
+The per-rule state machine — three states, and every arrow is a policy
+decision:
 
 #align(center)[
 #canvas(h: 3.0cm)[
@@ -476,28 +827,65 @@ The per-rule state machine:
 ]]
 #v(0.2em)
 
-Three more engineering points:
+Trace it left to right, and then — this is the part candidates skip — trace
+the *backward* edges, because the backward edges are where the humanity
+lives. Forward: a rule sits in OK (teal, leftmost) while its condition is
+false. The first true evaluation moves it to PENDING (amber, center) — and
+crucially, *no notification is sent*; the state change only starts a timer.
+This is the `for` duration incarnate: PENDING is a waiting room where brief
+spikes go to be forgotten. If the condition holds continuously until the
+timer elapses, the crimson arrow to FIRING fires — and *that* transition,
+and only that transition, pages a human. Look at the label under the
+PENDING→FIRING arrow: "`for` elapsed." The page is caused by the *timer*, not
+by the breach. A breach is cheap; a *sustained* breach is worth a human's
+sleep.
+
+Now the backward edges. From PENDING, a dashed slate arrow returns to OK
+labeled "false again → timer reset": the spike ended, the waiting room
+empties, nobody was woken, and the timer forgets everything — the
+*continuity* requirement means a single healthy evaluation flushes all
+accumulated suspicion. From FIRING, the long dashed teal arrow sweeps down
+and all the way back left to OK, labeled "clear threshold passed → resolved
+notification": when the metric recovers past the *clear* line (hysteresis —
+a different, stricter line than the fire line), exactly one more
+notification goes out, the resolution, and the machine returns to OK. Count
+notifications over a full incident lifecycle: one at firing, one at
+resolution. Two pages per incident, zero per evaluation. That count — not
+the states themselves — is the design's entire reason to exist, and
+Section 4.13's test suite proves the counting.
+
+Three more engineering points, each one learned by somebody the hard way:
 
 - *Deduplication and grouping.* One dying dependency fires forty service
   alerts; the engine groups by root labels (`region`, `dependency`) into *one*
   page with the forty attached as context. Notifications are facts about
-  *state transitions*, not about every evaluation.
+  *state transitions*, not about every evaluation. Without grouping, the
+  first casualty of a major outage is the on-call's ability to think —
+  forty simultaneous pages is information *destruction*, because the human
+  cannot read faster than the pager can scream.
 - *Evaluation must be independent of ingestion health of the thing it watches.*
   If the alerting engine shares a failure domain with the metrics pipeline, the
   one outage that must page is the one that can't. It runs on separate
   infrastructure and — critically — can fire on *absence* of data (Section
-  4.15).
+  4.15). Read that last property twice: an engine that only evaluates
+  thresholds cannot distinguish "all services healthy" from "all telemetry
+  stopped arriving." Absence alerting is how the platform pages about its own
+  blindness.
 - *Self-service with guardrails (FR-6).* Teams write rules in config; the
   platform validates them (query parses, series cardinality bounded, threshold
   sane) and versions every change, exactly the Chapter 3 rule-lifecycle
-  pattern.
+  pattern. The guardrails are not bureaucracy — an unvalidated alert rule is
+  a cron job that pages humans, and it deserves at least the review a cron
+  job gets.
 
 == Rust Reference Implementations
 
 Four distilled pieces, each with a deterministic test. They are teaching
 skeletons of what runs at platform scale: a mini inverted index for log
 search, timestamp compression for the TSDB, incremental rollups, and the
-alert state machine.
+alert state machine. Read each one as the executable form of a section you
+have already finished — Section 4.8, 4.9, 4.9, and 4.12 respectively — and
+the code will feel less like four programs and more like one argument.
 
 === A Mini Inverted Index for Log Search
 
@@ -606,6 +994,16 @@ mod tests {
 }
 ```
 
+Two design details to be able to narrate. First, the field-query trick:
+structured fields are indexed *as synthetic tokens* (`service:checkout`
+becomes just another key in the same map), so field filters ride the same
+machinery as full text with zero special cases — one structure, two query
+powers. Second, the `and` function is a classic merge join over sorted
+lists: two cursors, linear time, no hashing. And the test's final assertion
+encodes a whole incident workflow — "checkout errors involving payment and
+timeout" — answered by intersecting two lists, never by scanning records.
+That is Section 4.8's thesis with a green checkmark.
+
 Production engines add positions (for phrase queries), compression of posting
 lists, skip pointers for faster intersection, and segment files instead of a
 `HashMap` — but the *algorithm* the interviewer wants to hear is the sorted
@@ -615,7 +1013,13 @@ intersection above, unchanged since the 1960s.
 
 The honest core of Gorilla-style compression: store the first timestamp, then
 *delta-of-deltas*; encode each as a zigzag varint so small numbers — including
-small *negative* corrections — cost one byte.
+small *negative* corrections — cost one byte. Three tiny ideas compose here,
+so take them one at a time as the code introduces them: *delta* (store
+differences from the previous timestamp), *zigzag* (map signed values to
+unsigned so that small magnitudes of either sign become small unsigned
+ints), and *varint* (spend one byte on small values, more only when needed).
+None of the three is clever alone; stacked, they are why a steady 15-second
+scrape costs about a byte per point.
 
 ```rust
 /// Zigzag maps signed -> unsigned so small magnitudes (either sign)
@@ -714,6 +1118,16 @@ mod tests {
 }
 ```
 
+The middle test is the claim from Section 4.9, measured: a thousand perfect
+15-second-interval timestamps — 8,000 bytes naively — pack into under 1,100.
+And the third test answers the skeptic's question before it is asked: "what
+if the scrapes *aren't* perfectly regular?" Jitter and even a dropped sample
+survive the round trip exactly, because delta-of-delta degrades gracefully —
+irregularity costs a few extra bytes, never correctness. Compression schemes
+that are optimal only for perfect input are toys; this one is exact for all
+input and merely *cheaper* for regular input, which is the property that
+matters in production.
+
 Gorilla additionally XORs consecutive *values* and stores only meaningful
 bit-runs — the same philosophy: at scale, the difference between 16 bytes and
 1.4 bytes per sample is the difference between a petabyte and a rack.
@@ -722,7 +1136,13 @@ bit-runs — the same philosophy: at scale, the difference between 16 bytes and
 
 A rollup bucket carries just enough state to be mergeable: `sum`, `min`,
 `max`, `count`. Raw samples stream in; the bucket answers the five aggregates
-without remembering any sample.
+without remembering any sample. Stop and appreciate what "mergeable" buys
+you, because it is the whole scalability story of Section 4.9's retention
+ladder: if combining two buckets required their raw samples, rollup would be
+a batch job over petabytes; because the aggregates combine in O(1), an
+hour-bucket can become a day-bucket with four arithmetic operations and no
+memory of the past. Associativity — `(a + b) + c = a + (b + c)` — is doing
+systems work here.
 
 ```rust
 /// One downsampled bucket: mergeable in O(1) without raw samples.
@@ -811,11 +1231,25 @@ mod tests {
 }
 ```
 
+One choice in this listing deserves a question from you before the
+interviewer asks it: why does `avg` return an `Option`? Because an empty
+bucket has no average, and dividing `0.0` by `0` would produce `NaN` — a
+value that silently infects every aggregate it touches downstream. The type
+system is being used as a specification: *you cannot read an average without
+acknowledging the empty case.* Also note `min` starts at `+∞` and `max` at
+`−∞`, the identity elements of their operations — the same algebra trick
+that makes `merge` need the early-return on `count == 0`. These are small
+lines, but they are the difference between code that is correct by
+inspection and code that is correct by luck.
+
 === The Alert Evaluator: OK → PENDING → FIRING
 
 The state machine of Section 4.12, made executable. The test demonstrates the
 two failure modes it prevents: a single bad spike must *not* page (no `for`
 violation), and a sustained breach must page *once*, not on every evaluation.
+As you read the `match`, keep the diagram in view — each arm is one arrow,
+and the two `Some(Notification::…)` lines are the only two places in the
+entire system where a human gets woken.
 
 ```rust
 /// States of Section 4.12's machine. `pending_since` is Some(ms) while
@@ -929,7 +1363,22 @@ mod tests {
 }
 ```
 
+Read the `(Firing, true) => None` arm until it feels profound, because that
+one line is the entire product promise of FR-4's "once, not repeatedly":
+while a breach continues, the machine says nothing. All the urgency lives in
+the *transitions*; steady states — good or bad — are silent. And the third
+test encodes a policy you should state explicitly in the room: the threshold
+comparison is *strictly greater*, so a metric sitting exactly on the line is
+not a breach. Which convention you pick matters less than that you picked
+one, documented it, and made the boundary a tested behavior rather than an
+accident of floating-point mood.
+
 == Scaling the Platform
+
+Every tier scales a different axis by a different mechanism, and the table
+below is worth reading column-wise: first down the *scale axis* column to
+feel how heterogeneous the pressures are, then down the *mechanism* column to
+see how rarely the answer is "add more of the same."
 
 #tbl(
   (auto, 1fr, 1fr),
@@ -945,6 +1394,16 @@ mod tests {
   ),
 )
 
+Notice which rows are *boring* — agents, metrics writers, alerting — and
+which row carries the chapter's scaling anxiety: the TSDB, whose axis is not
+throughput at all but *cardinality × retention*. That is the cardinality
+nemesis of Section 4.9 surfacing in the capacity plan: samples/s is flat and
+small, but the number of *distinct series* is a product of human creativity
+in label design, and it grows whenever a team adds a label. You scale this
+axis with budgets and guardrails (rejecting write path label sets that
+exceed per-metric cardinality limits), not with hardware — a rare case where
+the scaling mechanism is a *policy enforced in code*.
+
 #insight([The incident storm is the sizing case])[
   Average load (2 GB/s) is not the design point; *everyone's worst day at once*
   is. An outage multiplies error logs 3–5×, and two thousand engineers open
@@ -952,10 +1411,19 @@ mod tests {
   cache absorbs the read spike; per-tenant quotas keep one service's panic
   from evicting the logs everyone else needs to debug it. A telemetry
   platform sized for the average is a platform that dies exactly when it is
-  needed.
+  needed. When the interviewer asks "what's your peak?", do not quote the
+  burst multiplier — explain the *correlation*: the load spike and the
+  importance spike are the same event, so there is no such thing as an
+  acceptable brownout.
 ]
 
 == Failure Modes & Degradation
+
+The degradation contract from Section 4.2 — metrics may shed, logs degrade by
+sampling, silence is never acceptable — now gets worked out component by
+component. Read each row's *Response* column and notice how often the answer
+references machinery you have already built; a good failure section should
+feel like reaping decisions, not making new ones.
 
 #tbl(
   (auto, 1fr, 1fr),
@@ -972,6 +1440,23 @@ mod tests {
   ),
 )
 
+Three rows deserve slow reading. The *index node lost* row hides an elegant
+property: the shard is rebuilt *from the buffer* — meaning the durable log is
+not only a shock absorber but a *backup* of everything still within its
+retention window. One mechanism, two jobs; this is why the buffer keeps
+winning every design argument. The *TSDB node lost* row shows the
+metrics-are-statistics permission slip in action: a gap in a dashboard is a
+cosmetic wound, and the `for` duration you designed in Section 4.12 — built
+to resist noisy metrics — turns out to also resist *missing* ones, because a
+brief gap cannot satisfy a continuity requirement. Designs that degrade
+gracefully usually do so because some earlier decision is quietly paying a
+second dividend. And the *alerting engine down* row is labeled "the silent
+killer" deliberately: every other failure in this table announces itself in
+telemetry somewhere, but a dead alerting engine's symptom is *the absence of
+pages*, which is indistinguishable from health — unless something outside
+the platform is watching, which is exactly the meta-observability problem
+Section 4.17 formalizes.
+
 #pitfall([Monitoring the monitor])[
   The most dangerous failure of an observability platform is *looking healthy
   while being blind*: dashboards render cached panels, no alerts fire, and
@@ -979,9 +1464,15 @@ mod tests {
   telemetry about itself into an *independent* pipeline — if the platform's
   own metrics flow through the platform, its failure erases its own
   death certificate. Section 4.17 formalizes this as meta-observability.
+  If you take one sentence from this pitfall into your career: a monitoring
+  system that can die quietly trains everyone to trust a corpse.
 ]
 
 == Trade-offs & Alternatives
+
+The receipt table, as always: what you bought, what you paid, and — this
+chapter's twist — what you *rejected*, stated well enough that a skeptic
+could resurrect the debate:
 
 #tbl(
   (auto, 1fr, 1fr),
@@ -997,10 +1488,23 @@ mod tests {
   ),
 )
 
+The last row is the one to be able to defend cold, because it inverts a
+reflex. "Why not just backpressure the agents with 429s, like any overloaded
+service?" Because the agent's backpressure propagates into *application
+hosts* — disk-full from unsent logs, blocked scrapes, poisoned deploys — and
+suddenly the observability platform is the *cause* of the incident it exists
+to observe. Shedding your own least-valuable data (metrics samples first,
+then sampled logs) keeps the pressure inside a system that was designed to
+shed. Chapter 3's limiter rejected *callers* to protect a *service*; this
+platform sheds *its own data* to protect *the callers' services*. Same
+mathematics, opposite direction — knowing which direction applies to you is
+the engineering.
+
 == SLOs & Meta-Observability
 
-The platform that measures everyone else's SLOs needs its own — measured from
-*outside*, by a small independent "meta-monitor" in a separate failure domain:
+The platform that measures everyone else's SLOs needs its own — measured
+from *outside*, by a small independent "meta-monitor" in a separate failure
+domain:
 
 #tbl(
   (auto, 1fr, auto),
@@ -1016,12 +1520,24 @@ The platform that measures everyone else's SLOs needs its own — measured from
   ),
 )
 
+Look at how each indicator closes a loop with an earlier promise. "Log
+searchability delay" is Section 4.2's 60-second freshness negotiation,
+rendered measurable. "Alert latency" is careful enough to write `≤ 1 min +
+for` — the SLO *excludes* the deliberate waiting room, because paging faster
+than the `for` duration would be a bug, not a success; an SLO that punishes
+correct behavior will be gamed or ignored, and both outcomes rot the
+culture. And "data loss ≈ 0" is scoped with legal precision — *acked* bytes
+found missing — because bytes never acknowledged are the buffer's honest
+rejects, not its broken promises.
+
 #tip([State the SLO *of* the telemetry system in the interview])[
   Candidates design observability for everyone else and forget the platform
   itself. Naming meta-observability — "who watches the watcher, and from
   which failure domain" — is a senior-level signal: it shows you have been
   paged by the monitoring system being down, not just by the systems it
-  monitors.
+  monitors. One sentence suffices: "and the platform's own health is watched
+  by a meta-monitor in a separate failure domain, because a watcher that
+  shares your fate cannot report it."
 ]
 
 == Interview Wrap-Up
@@ -1034,15 +1550,21 @@ Likely follow-ups and the shape of strong answers:
   keeps errors and slow outliers). Trace ids are *correlation keys*: log
   records carry `trace_id` so a log search pivots to the trace, and
   exemplars link metric spikes to example traces. The platform's buffer and
-  tiering lessons transfer directly.
+  tiering lessons transfer directly. (This is the payoff of Section 4.2's
+  "don't preclude it": the fork architecture already has a slot for a third
+  consumer of the buffer, and that sentence is the whole answer.)
 + *"How do you cut the log bill in half?"* Rank tenants by bytes; enforce
   structured logging; sample repetitive INFO lines at the agent (log 1-in-N,
   keep all WARN+); shorten hot retention for the noisiest services; negotiate
-  quotas. The answer is organizational as much as technical.
+  quotas. The answer is organizational as much as technical — the top three
+  noisiest services are usually 40% of the bill, and no compression scheme
+  beats a conversation with the team logging every health check at INFO.
 + *"PII ends up in logs — now what?"* Scrubbing is cheapest at the agent
   (pattern rules before anything leaves the host), enforced again at the
   indexer; access to raw logs is itself logged; cold-tier encryption keys
-  rotate. Treat telemetry as production data with a blast radius.
+  rotate. Treat telemetry as production data with a blast radius — a log
+  archive is a copy of every secret your services ever touched, indexed for
+  convenient search.
 + *"A team creates a label with user ids in it — what breaks?"* Cardinality
   explosion (Section 4.9): the TSDB's series index balloons, queries slow
   globally, and you are now storing identifiers you may not be allowed to
@@ -1088,6 +1610,10 @@ Likely follow-ups and the shape of strong answers:
 
 == Chapter Glossary
 
+Every term this chapter defined, collected for review. If a row feels
+unfamiliar, the section that defines it is worth a re-read before the next
+chapter — these words recur throughout the rest of the book.
+
 #tbl(
   (auto, 1fr),
   header: (hcell[Term], hcell[Meaning]),
@@ -1124,6 +1650,6 @@ Likely follow-ups and the shape of strong answers:
 #v(0.8em)
 #align(center)[
   #text(size: 8.5pt, fill: slate)[
-    — End of Chapter 4 · Next: Chapter 5—
+    — End of Chapter 4 · Next: Chapter 5, Designing a Comments System —
   ]
 ]
